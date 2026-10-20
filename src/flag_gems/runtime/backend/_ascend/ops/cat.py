@@ -15,7 +15,7 @@ def _cat_copy_flat_kernel(
     input_ptr,
     output_ptr,
     n_elements,
-    OUTPUT_OFFSET: tl.constexpr,
+    OUTPUT_OFFSET,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -123,8 +123,6 @@ def _cat_fill_triton(out, A, dim):
     if len(A) == 0 or out.numel() == 0:
         return
 
-    BLOCK_SIZE = 256
-
     output_cat_size = out.shape[dim]
     inner_size = math.prod(out.shape[dim + 1 :])
 
@@ -142,6 +140,11 @@ def _cat_fill_triton(out, A, dim):
                 a = a.contiguous()
 
             n_elements = a.numel()
+            min_block_size = triton.next_power_of_2(
+                max(1, triton.cdiv(n_elements, 65535))
+            )
+
+            BLOCK_SIZE = max(32768, min_block_size)
 
             grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
 

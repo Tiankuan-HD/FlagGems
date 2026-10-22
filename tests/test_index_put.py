@@ -684,3 +684,49 @@ def test_index_put__strided_rows_keep_the_shared_kernel():
     ref = _cpu_put(inp, [index], values)
     res = flag_gems.index_put_(inp.clone(), [index], values)
     _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("m", [1, 3, 512, 513, 65536])
+def test_index_put__scatter_counts(m):
+    # Every dimension indexed means one element per lane, which takes a third
+    # kernel. Its index tile is sized from the index count, so these straddle
+    # that; 3 and 513 are not powers of two.
+    n = 1 << 17
+    inp = torch.zeros(n, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.randperm(n)[:m])
+    values = _dev(torch.arange(1, m + 1, dtype=torch.float32))
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+def test_index_put__scatter_negative_indices():
+    inp = torch.zeros(16, dtype=torch.float32, device=flag_gems.device)
+    index = torch.tensor([-1, -5, 0, 3], dtype=torch.int64, device=flag_gems.device)
+    values = _dev(torch.arange(1, 5, dtype=torch.float32))
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_index_put__all_dims_indexed(accumulate):
+    # Two index tensors over a two-dimensional input: no sliced dimension is
+    # left, so the scatter kernel takes the store path and the shared kernel
+    # keeps the accumulate one.
+    inp = torch.zeros(32, 64, dtype=torch.float32, device=flag_gems.device)
+    i0 = _dev(torch.arange(20) % 32)
+    i1 = _dev((torch.arange(20) * 7) % 64)
+    values = torch.ones(20, dtype=torch.float32, device=flag_gems.device)
+
+    ref = _cpu_put(inp, [i0, i1], values, accumulate)
+    res = flag_gems.index_put_(inp.clone(), [i0, i1], values, accumulate)
+    _same_bits(res, ref)

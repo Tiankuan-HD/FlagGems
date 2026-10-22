@@ -33,6 +33,15 @@ one it would have launched. Only grids it could not have launched are
 reshaped. Sweeping the cap from one wave (48 programs here) up to 65535 moves
 the 1-D M=65536 case by 1%, so nothing is paid for the larger grid.
 
+A third kernel takes the opposite shape, where every dimension is indexed
+and each lane writes a single element. The store stays scattered, but the
+index and value reads are contiguous and only vectorize once the offsets are
+plain 1-D vectors; the shared kernel wraps them in a ``(BLOCK_SIZE0, 1)``
+tile whose second axis never spans anything, which at ``BLOCK_SIZE0 = 2``
+leaves two elements per program. For 65536 indices that is 2385 us against
+352, which is what ``aclnnIndexPutImpl`` takes. It is used for plain stores
+only: the order of stores is not observable, the order of atomic adds is.
+
 Where the put reduces to copying whole contiguous rows -- one trailing
 dimension, rank-1 indices, both operands innermost-contiguous -- a second
 kernel takes over, and it is worth about two orders of magnitude. The
@@ -80,6 +89,11 @@ MAX_CORE_DIM = 65535
 # fast: against a 5120-wide row, 2048 costs 3x the time 8192 does. 32768 does
 # not get through TritonToLinalg at all.
 FAST_TRAILING_BLOCK = 8192
+
+# Index tile of the scatter kernel. 512 lands on the vendor operator's time
+# for 65536 indices; 64 and 2048 are both about 10% worse, and 8192 does not
+# compile.
+SCATTER_BLOCK = 512
 
 
 def generate_index_put_kernel_ascend(
@@ -260,6 +274,143 @@ def generate_index_put_wrapper_ascend(
         code.writeline("return input")
     code.newline()
     code.newline()
+    return code
+
+
+def generate_index_put_scatter_kernel(
+    indices_len, index_rank, kernel_name: str, code: IndentedBuffer
+):
+    """Every dimension is indexed, so each lane writes one element.
+
+    The store is scattered and stays that way, but the index and value reads
+    are contiguous, and they only vectorize once the offsets are plain 1-D
+    vectors: the shared kernel wraps them in a ``(BLOCK_SIZE0, 1)`` tile whose
+    second axis never spans anything, and at ``BLOCK_SIZE0 = 2`` that leaves
+    two elements per program. For 65536 indices this is 2385 us against 352.
+    """
+    code.writeline("@libentry()")
+    code.writeline("@triton.jit")
+    code.writeline(f"def {kernel_name}(")
+    with code.indent():
+        args = ["input_ptr,"]
+        args += [f"indices{i}_ptr," for i in range(indices_len)]
+        args += ["values_ptr,"]
+        args += [f"input_shape{i}," for i in range(indices_len)]
+        for i in range(indices_len):
+            args += [f"indices{i}_shape{j}," for j in range(index_rank)]
+        args += [f"input_stride{i}," for i in range(indices_len)]
+        for i in range(indices_len):
+            args += [f"indices{i}_stride{j}," for j in range(index_rank)]
+        args += [f"values_stride{j}," for j in range(index_rank)]
+        args += ["M,", "BLOCK_SIZE0: tl.constexpr,"]
+        code.writelines(args)
+    code.writeline("):")
+
+    with code.indent():
+        code.writeline("pid0 = ext.program_id(axis=0)")
+        code.writeline("total0 = tl.cdiv(M, BLOCK_SIZE0)")
+        code.writeline("iter0 = tl.cdiv(total0, ext.num_programs(axis=0).to(tl.int32))")
+        code.writeline("for i0 in range(0, iter0):")
+        with code.indent():
+            code.writeline(
+                "offset0 = (pid0 * iter0 + i0) * BLOCK_SIZE0"
+                " + tl.arange(0, BLOCK_SIZE0)"
+            )
+            code.writeline("mask0 = offset0 < M")
+            code.writeline("cur_idx = offset0")
+            for j in range(index_rank - 1, -1, -1):
+                code.writeline(f"indices_idx{j} = cur_idx % indices0_shape{j}")
+                code.writeline(f"cur_idx = cur_idx // indices0_shape{j}")
+            code.newline()
+            for i in range(indices_len):
+                comp = " + ".join(
+                    f"indices_idx{j} * indices{i}_stride{j}" for j in range(index_rank)
+                )
+                code.writeline(
+                    f"cur_index{i} = tl.load(indices{i}_ptr + {comp},"
+                    " mask=mask0, other=0)"
+                )
+                code.writeline(
+                    f"cur_index{i} = tl.where(cur_index{i} < 0,"
+                    f" cur_index{i} + input_shape{i}, cur_index{i})"
+                )
+            index_mask = " & ".join(
+                f"(cur_index{i} >= 0) & (cur_index{i} < input_shape{i})"
+                for i in range(indices_len)
+            )
+            code.writeline(f"mask = mask0 & {index_mask}")
+            code.newline()
+            code.writeline(
+                "input_offset = "
+                + " + ".join(
+                    f"cur_index{i} * input_stride{i}" for i in range(indices_len)
+                )
+            )
+            code.writeline(
+                "values_offset = "
+                + " + ".join(
+                    f"indices_idx{j} * values_stride{j}" for j in range(index_rank)
+                )
+            )
+            code.writeline("cur_value = tl.load(values_ptr + values_offset, mask=mask)")
+            code.writeline("tl.store(input_ptr + input_offset, cur_value, mask=mask)")
+    code.newline()
+    code.newline()
+    return code
+
+
+def generate_index_put_scatter_wrapper(
+    indices_len, index_rank, wrapper_name: str, kernel_name: str, code: IndentedBuffer
+):
+    code.writeline(
+        f"def {wrapper_name}(input, indices, values, accumulate, max_programs):"
+    )
+    with code.indent():
+        code.writeline("input_shape = input.shape")
+        code.writeline("input_stride = input.stride()")
+        for i in range(indices_len):
+            code.writeline(f"indices{i}_shape = indices[{i}].shape")
+            code.writeline(f"indices{i}_stride = indices[{i}].stride()")
+        code.writeline("values_stride = values.stride()")
+        code.writeline("M = indices[0].numel()")
+        code.newline()
+        code.writeline(f"block0 = min(triton.next_power_of_2(M), {SCATTER_BLOCK})")
+        code.writeline("grid = (min(triton.cdiv(M, block0), max_programs),)")
+        code.newline()
+        code.writeline(f"{kernel_name}[grid](")
+        with code.indent():
+            args = ["input,"]
+            args += [f"indices[{i}]," for i in range(indices_len)]
+            args += ["values,"]
+            args += [f"input_shape[{i}]," for i in range(indices_len)]
+            for i in range(indices_len):
+                args += [f"indices{i}_shape[{j}]," for j in range(index_rank)]
+            args += [f"input_stride[{i}]," for i in range(indices_len)]
+            for i in range(indices_len):
+                args += [f"indices{i}_stride[{j}]," for j in range(index_rank)]
+            args += [f"values_stride[{j}]," for j in range(index_rank)]
+            args += ["M,"]
+            code.writelines(args)
+            code.writeline("BLOCK_SIZE0=block0,")
+        code.writeline(")")
+        code.writeline("return input")
+    code.newline()
+    code.newline()
+    return code
+
+
+def generate_scatter_code_ascend(
+    indices_len: int,
+    index_rank: int,
+    wrapper_name: str,
+    kernel_name: str,
+    code: IndentedBuffer,
+):
+    code = generate_imports(code)
+    generate_index_put_scatter_kernel(indices_len, index_rank, kernel_name, code)
+    generate_index_put_scatter_wrapper(
+        indices_len, index_rank, wrapper_name, kernel_name, code
+    )
     return code
 
 
@@ -445,22 +596,30 @@ class AscendIndexPutFunction:
     def __init__(self):
         self.overloads = {}
 
-    def arg_key(self, inp, tensor_indices, rowwise):
+    def arg_key(self, inp, tensor_indices, variant):
         indices_len = len(tensor_indices)
         index_rank = 0 if indices_len == 0 else tensor_indices[0].ndim
         key = f"inp_rank_{inp.ndim}_indices_len_{indices_len}_index_rank_{index_rank}"
-        return key + "_rowwise" if rowwise else key
+        return f"{key}_{variant}" if variant else key
 
-    def __call__(self, inp, tensor_indices, values, accumulate, rowwise=False):
-        key = self.arg_key(inp, tensor_indices, rowwise)
+    def __call__(self, inp, tensor_indices, values, accumulate, variant=""):
+        key = self.arg_key(inp, tensor_indices, variant)
         overload = self.overloads.get(key)
         if overload is None:
             code = IndentedBuffer()
-            if rowwise:
+            if variant == "rowwise":
                 code = generate_rowwise_code_ascend(
                     len(tensor_indices),
                     "_index_put_wrapper",
                     "_index_put_rowwise_jit_function",
+                    code,
+                )
+            elif variant == "scatter":
+                code = generate_scatter_code_ascend(
+                    len(tensor_indices),
+                    tensor_indices[0].ndim,
+                    "_index_put_wrapper",
+                    "_index_put_scatter_jit_function",
                     code,
                 )
             else:
@@ -665,11 +824,17 @@ def _launch(inp_view, tensors, values, slice_shape, accumulate):
     if tensors[0].numel() == 0 or math.prod(slice_shape) == 0:
         logger.debug("GEMS_ASCEND INDEX_PUT empty, nothing to write")
         return
+    if not slice_shape and not accumulate:
+        # Every dimension indexed: one element per lane, and the order plain
+        # stores land in is not observable. The accumulate path keeps the
+        # shared kernel, where the order its atomics land in is.
+        _ascend_index_put_func(inp_view, tensors, values, accumulate, "scatter")
+        return
     folded = _fold_trailing(inp_view, values, slice_shape)
     if _rowwise_eligible(folded[0], tensors, folded[1], folded[2]):
-        _ascend_index_put_func(folded[0], tensors, folded[1], accumulate, True)
+        _ascend_index_put_func(folded[0], tensors, folded[1], accumulate, "rowwise")
         return
-    _ascend_index_put_func(inp_view, tensors, values, accumulate, False)
+    _ascend_index_put_func(inp_view, tensors, values, accumulate)
 
 
 def index_put_(inp, indices, values, accumulate=False):

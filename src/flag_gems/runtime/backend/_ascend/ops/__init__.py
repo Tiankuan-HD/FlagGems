@@ -71,6 +71,7 @@ from .index import index
 from .index_add import index_add, index_add_
 from .index_copy_ import index_copy, index_copy_
 from .index_fill import index_fill, index_fill_
+from .index_put import _index_put_impl_, index_put, index_put_
 from .index_reduce import index_reduce, index_reduce_, index_reduce_out
 from .index_select import index_select
 from .isin import isin
@@ -182,6 +183,7 @@ from .zeros_like import zeros_like
 
 __all__ = [
     "_dyn_quant_matmul_4bit",
+    "_index_put_impl_",
     "_segment_reduce_backward",
     "_segment_reduce_backward_out",
     "_unique2",
@@ -261,6 +263,8 @@ __all__ = [
     "index_copy_",
     "index_fill",
     "index_fill_",
+    "index_put",
+    "index_put_",
     "index_reduce",
     "index_reduce_",
     "index_reduce_out",

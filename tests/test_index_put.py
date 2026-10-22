@@ -345,3 +345,291 @@ def test_index_put_mixed_none_and_tensor(input_shape, indices_config, dtype):
 
     out = flag_gems.index_put(inp, indices, values, accumulate)
     utils.gems_assert_close(out, ref_out, dtype)
+
+
+# ── Ascend: launch limits and the semantics the generic kernel drops ───────
+#
+# All of the following are marked Ascend-only. The launch-grid ones describe a
+# limit no other backend has, and the rest fail on the generic implementation,
+# which these tests are not trying to gate.
+
+_ASCEND_MAX_CORE_DIM = 65535
+_ascend_only = pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend", reason="Ascend-specific launch limit"
+)
+
+
+def _core_dim(m, n, block0=2, block1=2048):
+    """The flattened grid the Ascend driver sees: coreDim = x * y * z."""
+    return -(-m // block0) * -(-n // block1)
+
+
+def _same_bits(res, ref):
+    """Compare the raw bytes.
+
+    With distinct indices index_put is a pure copy, so anything short of an
+    exact match is a defect, and a tolerance would also hide -0.0 turning into
+    0.0. Duplicate indices are only ever compared on the accumulate path,
+    where the expected value is an exact integer.
+    """
+    assert res.dtype == ref.dtype, f"{res.dtype} != {ref.dtype}"
+    assert res.shape == ref.shape, f"{tuple(res.shape)} != {tuple(ref.shape)}"
+    # reshape(-1) first: view(uint8) refuses a 0-dim tensor.
+    a = res.cpu().reshape(-1).contiguous().view(torch.uint8)
+    b = ref.cpu().reshape(-1).contiguous().view(torch.uint8)
+    assert torch.equal(a, b), f"{int((a != b).sum())} of {a.numel()} bytes differ"
+
+
+def _cpu_put(inp, indices, values, accumulate=False):
+    """Reference on CPU rather than on the device.
+
+    torch_npu's own aten::_index_put_impl_ segfaults on an index list with a
+    None in the middle, so it cannot referee those cases.
+    """
+    out = inp.cpu().clone()
+    idx = [None if i is None else i.cpu() for i in indices]
+    return torch.ops.aten.index_put_(out, idx, values.cpu(), accumulate)
+
+
+def _dev(t):
+    return t.to(flag_gems.device)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+def test_index_put__grid_over_core_dim():
+    # cdiv(M, BLOCK_SIZE0) passes 65535 on its own here, so the generic
+    # implementation aborts the process:
+    #   EE1003: KernelLaunch failed because value 131072 for parameter coreDim
+    #           is invalid. Expected value: less than or equal to 65535.
+    n, m = 2**20, 2**18
+    assert _core_dim(m, 1) > _ASCEND_MAX_CORE_DIM
+    inp = torch.zeros(n, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.randperm(n)[:m])
+    values = torch.arange(1, m + 1, dtype=torch.float32, device=flag_gems.device)
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+def test_index_put__grid_over_core_dim_both_axes():
+    # Here neither axis is over on its own, their product is: 32768 * 2.
+    # values stays a single element and is broadcast, so the case costs one
+    # page of memory rather than the 1 GiB a materialized (M, N) would.
+    rows, cols, m = 64, 4096, 2**16
+    assert _core_dim(m, cols) > _ASCEND_MAX_CORE_DIM
+    inp = torch.zeros(rows, cols, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.arange(m) % rows)
+    values = torch.ones(1, dtype=torch.float32, device=flag_gems.device)
+
+    # Every slot takes m // rows additions of 1.0, an exact integer in fp32.
+    ref = torch.full((rows, cols), float(m // rows), dtype=torch.float32)
+    res = flag_gems.index_put_(inp.clone(), [index], values, True)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_index_put__empty_index(accumulate):
+    # An empty index tensor is a no-op, but it makes the flattened grid 0 and
+    # the driver rejects that too: EE1003 ... coreDim ... expected: not equal
+    # to 0.
+    inp = torch.randn(32, 64, dtype=torch.float32, device=flag_gems.device)
+    index = torch.empty(0, dtype=torch.int64, device=flag_gems.device)
+    values = torch.empty(0, 64, dtype=torch.float32, device=flag_gems.device)
+
+    res = flag_gems.index_put_(inp.clone(), [index], values, accumulate)
+    _same_bits(res, inp)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_index_put__negative_indices(accumulate):
+    # -1 addresses the last row here as it does everywhere else in torch. The
+    # generic kernel masks with `cur_index >= 0` and silently drops the write.
+    inp = torch.zeros(8, 4, dtype=torch.float32, device=flag_gems.device)
+    index = torch.tensor([-1, -3, 0, 2], dtype=torch.int64, device=flag_gems.device)
+    values = torch.arange(1, 17, dtype=torch.float32, device=flag_gems.device).reshape(
+        4, 4
+    )
+
+    ref = _cpu_put(inp, [index], values, accumulate)
+    res = flag_gems.index_put_(inp.clone(), [index], values, accumulate)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize(
+    "shape,positions",
+    [
+        ((32, 64), (1,)),  # trailing index, leading slice
+        ((8, 16, 32), (1,)),  # index in the middle
+        ((8, 16, 32), (2,)),  # index last
+        ((8, 16, 32), (0, 2)),  # indices split by a slice
+        ((8, 16, 32), (1, 2)),  # two adjacent indices, not leading
+    ],
+)
+def test_index_put__none_in_indices(shape, positions):
+    # A None entry means "take the whole dimension". When the tensor indices
+    # are separated by a slice torch puts the broadcast dimensions first,
+    # otherwise it leaves them in place; values has to follow either way.
+    k = 5
+    indices = [None] * len(shape)
+    for pos in positions:
+        indices[pos] = _dev(torch.randperm(shape[pos])[:k])
+
+    inp = torch.zeros(shape, dtype=torch.float32, device=flag_gems.device)
+    key = tuple(slice(None) if i is None else i.cpu() for i in indices)
+    probe = inp.cpu()[key]
+    values = _dev(
+        torch.arange(1, probe.numel() + 1, dtype=torch.float32).reshape(probe.shape)
+    )
+
+    ref = _cpu_put(inp, indices, values)
+    res = flag_gems.index_put_(inp.clone(), indices, values)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+def test_index_put__accumulate_duplicates_exact():
+    # 4096 updates onto 64 slots is 85 waves of the 48 vector cores. Every
+    # slot has to land on an exact integer, so a lost atomic add shows up as a
+    # differing byte instead of as drift under a tolerance.
+    slots, m = 64, 4096
+    inp = torch.zeros(slots, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.arange(m) % slots)
+    values = torch.ones(m, dtype=torch.float32, device=flag_gems.device)
+
+    res = flag_gems.index_put_(inp.clone(), [index], values, True)
+    _same_bits(res, torch.full((slots,), float(m // slots), dtype=torch.float32))
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("layout", ["transpose", "slice", "strided-slice"])
+def test_index_put__noncontiguous_input(layout):
+    base = torch.arange(1, 4097, dtype=torch.float32, device=flag_gems.device).reshape(
+        64, 64
+    )
+    if layout == "transpose":
+        inp = base.clone().t()
+    elif layout == "slice":
+        inp = base.clone()[8:24]
+    else:
+        inp = base.clone()[::2, ::2]
+
+    index = _dev(torch.randperm(inp.shape[0])[:7])
+    values = _dev(
+        torch.arange(1, 7 * inp.shape[1] + 1, dtype=torch.float32).reshape(
+            7, inp.shape[1]
+        )
+    )
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+        torch.bool,
+    ],
+)
+def test_index_put__dtypes(dtype):
+    rows, cols, k = 256, 8, 32
+    if dtype is torch.bool:
+        inp = torch.zeros(rows, cols, dtype=dtype, device=flag_gems.device)
+        values = torch.ones(k, cols, dtype=dtype, device=flag_gems.device)
+    elif dtype.is_floating_point:
+        inp = torch.zeros(rows, cols, dtype=dtype, device=flag_gems.device)
+        values = _dev(
+            (torch.arange(1, k * cols + 1, dtype=torch.float32) / 8)
+            .reshape(k, cols)
+            .to(dtype)
+        )
+    else:
+        inp = torch.zeros(rows, cols, dtype=dtype, device=flag_gems.device)
+        values = _dev(torch.arange(1, k * cols + 1, dtype=dtype).reshape(k, cols))
+
+    index = _dev(torch.randperm(rows)[:k])
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put
+@_ascend_only
+def test_index_put_out_of_place_leaves_input_alone():
+    # index_put clones first; the clone is what the kernel writes through.
+    inp = torch.zeros(64, 8, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.randperm(64)[:9])
+    values = _dev(torch.arange(1, 73, dtype=torch.float32).reshape(9, 8))
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put(inp, [index], values)
+    _same_bits(res, ref)
+    _same_bits(inp, torch.zeros(64, 8, dtype=torch.float32))
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_index_put__three_dimensional_input(accumulate):
+    # Two sliced dimensions behind the index, which the kernel recovers from
+    # the lane offset with a chain of % and //.
+    inp = torch.zeros(16, 8, 32, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.randperm(16)[:5])
+    values = _dev(
+        torch.arange(1, 5 * 8 * 32 + 1, dtype=torch.float32).reshape(5, 8, 32)
+    )
+
+    ref = _cpu_put(inp, [index], values, accumulate)
+    res = flag_gems.index_put_(inp.clone(), [index], values, accumulate)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+def test_index_put__permuted_input():
+    # The sliced dimensions are not contiguous here, so every lane offset has
+    # to go through the strides rather than through a single run.
+    base = torch.zeros(4, 8, 16, dtype=torch.float32, device=flag_gems.device)
+    inp = base.permute(0, 2, 1)
+    assert not inp.is_contiguous()
+    index = _dev(torch.randperm(4)[:3])
+    values = _dev(
+        torch.arange(1, 3 * 16 * 8 + 1, dtype=torch.float32).reshape(3, 16, 8)
+    )
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+def test_index_put__broadcast_scalar_values():
+    # values arrives as a stride-0 view of one element; every lane has to read
+    # that element rather than walk off it.
+    inp = torch.zeros(32, 4, 8, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.randperm(32)[:6])
+    values = torch.tensor(2.5, dtype=torch.float32, device=flag_gems.device)
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)

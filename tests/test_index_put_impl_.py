@@ -202,3 +202,160 @@ def test__index_put_impl__error_all_none(dtype):
 
     with pytest.raises(ValueError):
         flag_gems._index_put_impl_(inp, indices, values, accumulate=False, unsafe=False)
+
+
+# ── Ascend: launch limits and the semantics the generic kernel drops ───────
+#
+# _index_put_impl_ is the entry the dispatcher uses for `tensor[idx] = value`,
+# and unlike index_put_ the generic version hands the kernel the non-None
+# entries of `indices` without first moving the indexed dimensions to the
+# front. These are Ascend-only: the generic implementation does not pass them.
+
+_ASCEND_MAX_CORE_DIM = 65535
+_ascend_only = pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend", reason="Ascend-specific launch limit"
+)
+
+
+def _core_dim(m, n, block0=2, block1=2048):
+    """The flattened grid the Ascend driver sees: coreDim = x * y * z."""
+    return -(-m // block0) * -(-n // block1)
+
+
+def _same_bits(res, ref):
+    """Compare the raw bytes; see tests/test_index_put.py for the reasoning."""
+    assert res.dtype == ref.dtype, f"{res.dtype} != {ref.dtype}"
+    assert res.shape == ref.shape, f"{tuple(res.shape)} != {tuple(ref.shape)}"
+    a = res.cpu().reshape(-1).contiguous().view(torch.uint8)
+    b = ref.cpu().reshape(-1).contiguous().view(torch.uint8)
+    assert torch.equal(a, b), f"{int((a != b).sum())} of {a.numel()} bytes differ"
+
+
+def _cpu_put(inp, indices, values, accumulate=False):
+    """Reference on CPU: torch_npu's own aten::_index_put_impl_ segfaults on
+    an index list with a None in the middle, so it cannot referee that case."""
+    out = inp.cpu().clone()
+    idx = [None if i is None else i.cpu() for i in indices]
+    return torch.ops.aten.index_put_(out, idx, values.cpu(), accumulate)
+
+
+def _dev(t):
+    return t.to(flag_gems.device)
+
+
+@pytest.mark.index_put_impl_
+@_ascend_only
+def test__index_put_impl__grid_over_core_dim():
+    # EE1003: KernelLaunch failed because value 131072 for parameter coreDim
+    #         is invalid. Expected value: less than or equal to 65535.
+    n, m = 2**20, 2**18
+    assert _core_dim(m, 1) > _ASCEND_MAX_CORE_DIM
+    inp = torch.zeros(n, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.randperm(n)[:m])
+    values = torch.arange(1, m + 1, dtype=torch.float32, device=flag_gems.device)
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems._index_put_impl_(inp.clone(), [index], values, False, False)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_impl_
+@_ascend_only
+@pytest.mark.parametrize("accumulate", [False, True])
+def test__index_put_impl__empty_index(accumulate):
+    # A no-op that the driver still refuses to launch: coreDim must not be 0.
+    inp = torch.randn(32, 64, dtype=torch.float32, device=flag_gems.device)
+    index = torch.empty(0, dtype=torch.int64, device=flag_gems.device)
+    values = torch.empty(0, 64, dtype=torch.float32, device=flag_gems.device)
+
+    res = flag_gems._index_put_impl_(inp.clone(), [index], values, accumulate, False)
+    _same_bits(res, inp)
+
+
+@pytest.mark.index_put_impl_
+@_ascend_only
+@pytest.mark.parametrize("accumulate", [False, True])
+def test__index_put_impl__negative_indices(accumulate):
+    inp = torch.zeros(8, 4, dtype=torch.float32, device=flag_gems.device)
+    index = torch.tensor([-1, -3, 0, 2], dtype=torch.int64, device=flag_gems.device)
+    values = torch.arange(1, 17, dtype=torch.float32, device=flag_gems.device).reshape(
+        4, 4
+    )
+
+    ref = _cpu_put(inp, [index], values, accumulate)
+    res = flag_gems._index_put_impl_(inp.clone(), [index], values, accumulate, False)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_impl_
+@_ascend_only
+@pytest.mark.parametrize(
+    "shape,positions",
+    [
+        ((32, 64), (1,)),
+        ((8, 16, 32), (1,)),
+        ((8, 16, 32), (2,)),
+        ((8, 16, 32), (0, 2)),
+    ],
+)
+def test__index_put_impl__none_in_indices(shape, positions):
+    # The generic version raises here ("the number of sizes provided (1) must
+    # be greater or equal to the number of dimensions in the tensor"), because
+    # it builds the broadcast target from the index tensors alone.
+    k = 5
+    indices = [None] * len(shape)
+    for pos in positions:
+        indices[pos] = _dev(torch.randperm(shape[pos])[:k])
+
+    inp = torch.zeros(shape, dtype=torch.float32, device=flag_gems.device)
+    key = tuple(slice(None) if i is None else i.cpu() for i in indices)
+    probe = inp.cpu()[key]
+    values = _dev(
+        torch.arange(1, probe.numel() + 1, dtype=torch.float32).reshape(probe.shape)
+    )
+
+    ref = _cpu_put(inp, indices, values)
+    res = flag_gems._index_put_impl_(inp.clone(), indices, values, False, False)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_impl_
+@_ascend_only
+@pytest.mark.parametrize("values_kind", ["rows", "all-dims", "scalar"])
+def test__index_put_impl__bool_mask(values_kind):
+    # A single bool mask over the leading dimension picks whole rows; a mask
+    # over every dimension picks scalars and lets values arrive flat, which
+    # is the shape plain broadcasting against the selection would reject.
+    rows, cols = 64, 8
+    inp = torch.zeros(rows, cols, dtype=torch.float32, device=flag_gems.device)
+
+    if values_kind == "rows":
+        mask = _dev(torch.arange(rows) % 3 == 0)
+        k = int(mask.sum())
+        values = _dev(
+            torch.arange(1, k * cols + 1, dtype=torch.float32).reshape(k, cols)
+        )
+    elif values_kind == "all-dims":
+        mask = _dev((torch.arange(rows * cols) % 5 == 0).reshape(rows, cols))
+        k = int(mask.sum())
+        values = _dev(torch.arange(1, k + 1, dtype=torch.float32))
+    else:
+        mask = _dev(torch.arange(rows) % 3 == 0)
+        values = torch.tensor(3.5, dtype=torch.float32, device=flag_gems.device)
+
+    ref = _cpu_put(inp, [mask], values)
+    res = flag_gems._index_put_impl_(inp.clone(), [mask], values, False, False)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_impl_
+@_ascend_only
+def test__index_put_impl__accumulate_duplicates_exact():
+    # 85 waves of the 48 vector cores, every slot landing on an exact integer.
+    slots, m = 64, 4096
+    inp = torch.zeros(slots, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.arange(m) % slots)
+    values = torch.ones(m, dtype=torch.float32, device=flag_gems.device)
+
+    res = flag_gems._index_put_impl_(inp.clone(), [index], values, True, False)
+    _same_bits(res, torch.full((slots,), float(m // slots), dtype=torch.float32))

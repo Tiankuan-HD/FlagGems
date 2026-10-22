@@ -633,3 +633,54 @@ def test_index_put__broadcast_scalar_values():
     ref = _cpu_put(inp, [index], values)
     res = flag_gems.index_put_(inp.clone(), [index], values)
     _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("cols", [1, 7, 64, 4096, 5120, 8192, 8193, 70000])
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_index_put__row_widths(cols, accumulate):
+    # Copying whole rows takes a separate kernel that sizes its trailing tile
+    # from the row width, and tiles the row once it is wider than one tile.
+    # These widths straddle that, and 7 and 8193 are not powers of two.
+    rows, k = 8, 5
+    inp = torch.zeros(rows, cols, dtype=torch.float32, device=flag_gems.device)
+    index = _dev(torch.randperm(rows)[:k])
+    # Distinct indices and a value of 1.0: the accumulate result is an exact
+    # integer, so a lost or doubled write shows up as a differing byte.
+    values = torch.ones(k, cols, dtype=torch.float32, device=flag_gems.device)
+
+    ref = _cpu_put(inp, [index], values, accumulate)
+    res = flag_gems.index_put_(inp.clone(), [index], values, accumulate)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_index_put__two_indices_row_copy(accumulate):
+    # Two index tensors address a row of the last dimension between them.
+    inp = torch.zeros(8, 16, 32, dtype=torch.float32, device=flag_gems.device)
+    i0 = _dev(torch.tensor([0, 3, 7]))
+    i1 = _dev(torch.tensor([1, 15, 4]))
+    values = _dev(torch.arange(1, 3 * 32 + 1, dtype=torch.float32).reshape(3, 32))
+
+    ref = _cpu_put(inp, [i0, i1], values, accumulate)
+    res = flag_gems.index_put_(inp.clone(), [i0, i1], values, accumulate)
+    _same_bits(res, ref)
+
+
+@pytest.mark.index_put_
+@_ascend_only
+def test_index_put__strided_rows_keep_the_shared_kernel():
+    # A column slice leaves the row non-contiguous, so the row-copy kernel
+    # declines it; the shared kernel still has to get it right.
+    base = torch.zeros(32, 64, dtype=torch.float32, device=flag_gems.device)
+    inp = base[:, ::2]
+    assert inp.stride(-1) == 2
+    index = _dev(torch.randperm(32)[:9])
+    values = _dev(torch.arange(1, 9 * 32 + 1, dtype=torch.float32).reshape(9, 32))
+
+    ref = _cpu_put(inp, [index], values)
+    res = flag_gems.index_put_(inp.clone(), [index], values)
+    _same_bits(res, ref)

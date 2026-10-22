@@ -33,6 +33,20 @@ one it would have launched. Only grids it could not have launched are
 reshaped. Sweeping the cap from one wave (48 programs here) up to 65535 moves
 the 1-D M=65536 case by 1%, so nothing is paid for the larger grid.
 
+Where the put reduces to copying whole contiguous rows -- one trailing
+dimension, rank-1 indices, both operands innermost-contiguous -- a second
+kernel takes over, and it is worth about two orders of magnitude. The
+difference is that it addresses a row from a *scalar* base: one program step
+per index, so ``cur_index`` is a scalar and the lane offset is a plain
+``arange``, which the backend turns into contiguous vector moves. The shared
+kernel builds a two-dimensional table of addresses instead, each lane
+carrying its own row base through a ``%``/``//`` chain, and the backend falls
+back to scalar moves -- the "discrete access mapped to scalar" case the
+Triton-Ascend migration guide warns about. On ``(1024, 5120)`` bf16 that is
+17.2 ms against 90 us, with ``aclnnIndexPutImpl`` at 55 us; both halves are
+needed, a scalar base while the ``%`` stays costs 15.1 ms and dropping the
+``%`` under a vector base costs 15.8 ms.
+
 Two correctness gaps of the generic implementation are fixed here as well:
 
 * negative indices are part of the aten semantics, but the generic kernel
@@ -61,6 +75,11 @@ logger = logging.getLogger(__name__)
 # The flattened grid the driver will accept, i.e. the hard ceiling the capped
 # launch has to stay under even when the device reports more cores than that.
 MAX_CORE_DIM = 65535
+
+# Trailing tile of the row-wise kernel. One tile per row is what makes it
+# fast: against a 5120-wide row, 2048 costs 3x the time 8192 does. 32768 does
+# not get through TritonToLinalg at all.
+FAST_TRAILING_BLOCK = 8192
 
 
 def generate_index_put_kernel_ascend(
@@ -244,6 +263,162 @@ def generate_index_put_wrapper_ascend(
     return code
 
 
+def generate_index_put_rowwise_kernel(
+    indices_len, kernel_name: str, code: IndentedBuffer
+):
+    """One index per loop step, so the row base is a scalar.
+
+    Only emitted for ``inp_rank == indices_len + 1`` with rank-1 indices: the
+    whole put is then "copy row r of values onto row cur_index of input".
+    """
+    inp_rank = indices_len + 1
+    code.writeline("@libentry()")
+    code.writeline("@triton.jit")
+    code.writeline(f"def {kernel_name}(")
+    with code.indent():
+        args = ["input_ptr,"]
+        args += [f"indices{i}_ptr," for i in range(indices_len)]
+        args += ["values_ptr,"]
+        args += [f"input_shape{i}," for i in range(inp_rank)]
+        args += [f"indices{i}_shape0," for i in range(indices_len)]
+        args += [f"input_stride{i}," for i in range(inp_rank)]
+        args += [f"indices{i}_stride0," for i in range(indices_len)]
+        args += ["values_stride0,", "values_stride1,"]
+        args += [
+            "M,",
+            "N,",
+            "IS_ACCUMULATE: tl.constexpr,",
+            "BLOCK_SIZE1: tl.constexpr,",
+        ]
+        code.writelines(args)
+    code.writeline("):")
+
+    with code.indent():
+        code.writeline("pid0 = ext.program_id(axis=0)")
+        code.writeline("pid1 = ext.program_id(axis=1)")
+        code.writeline("iter0 = tl.cdiv(M, ext.num_programs(axis=0).to(tl.int32))")
+        code.writeline("for i0 in range(0, iter0):")
+        with code.indent():
+            code.writeline("r = pid0 * iter0 + i0")
+            code.writeline("if r < M:")
+            with code.indent():
+                for i in range(indices_len):
+                    code.writeline(
+                        f"cur_index{i} = tl.load("
+                        f"indices{i}_ptr + r * indices{i}_stride0)"
+                    )
+                    code.writeline(
+                        f"cur_index{i} = tl.where(cur_index{i} < 0,"
+                        f" cur_index{i} + input_shape{i}, cur_index{i})"
+                    )
+                guard = " & ".join(
+                    f"(cur_index{i} >= 0) & (cur_index{i} < input_shape{i})"
+                    for i in range(indices_len)
+                )
+                code.writeline(f"if {guard}:")
+                with code.indent():
+                    base = " + ".join(
+                        f"cur_index{i} * input_stride{i}" for i in range(indices_len)
+                    )
+                    code.writeline(f"row_offset = {base}")
+                    code.writeline("total1 = tl.cdiv(N, BLOCK_SIZE1)")
+                    code.writeline(
+                        "iter1 = tl.cdiv(total1,"
+                        " ext.num_programs(axis=1).to(tl.int32))"
+                    )
+                    code.writeline("for i1 in range(0, iter1):")
+                    with code.indent():
+                        code.writeline(
+                            "offset1 = (pid1 * iter1 + i1) * BLOCK_SIZE1"
+                            " + tl.arange(0, BLOCK_SIZE1)"
+                        )
+                        code.writeline("mask1 = offset1 < N")
+                        code.writeline(
+                            "input_offset = row_offset"
+                            f" + offset1 * input_stride{indices_len}"
+                        )
+                        code.writeline(
+                            "values_offset = r * values_stride0"
+                            " + offset1 * values_stride1"
+                        )
+                        code.writeline(
+                            "cur_value = tl.load(values_ptr + values_offset, mask=mask1)"
+                        )
+                        code.writeline("if IS_ACCUMULATE:")
+                        with code.indent():
+                            code.writeline(
+                                "tl.atomic_add(input_ptr + input_offset,"
+                                " cur_value, mask=mask1)"
+                            )
+                        code.writeline("else:")
+                        with code.indent():
+                            code.writeline(
+                                "tl.store(input_ptr + input_offset,"
+                                " cur_value, mask=mask1)"
+                            )
+    code.newline()
+    code.newline()
+    return code
+
+
+def generate_index_put_rowwise_wrapper(
+    indices_len, wrapper_name: str, kernel_name: str, code: IndentedBuffer
+):
+    inp_rank = indices_len + 1
+    code.writeline(
+        f"def {wrapper_name}(input, indices, values, accumulate, max_programs):"
+    )
+    with code.indent():
+        code.writeline("input_shape = input.shape")
+        code.writeline("input_stride = input.stride()")
+        for i in range(indices_len):
+            code.writeline(f"indices{i}_stride = indices[{i}].stride()")
+        code.writeline("values_stride = values.stride()")
+        code.writeline("M = indices[0].numel()")
+        code.writeline(f"N = input_shape[{indices_len}]")
+        code.newline()
+        # One tile per row wherever it fits: a trailing tile of 2048 against a
+        # 5120-wide row costs 3x the time of one that covers the row in one go,
+        # and 32768 does not survive TritonToLinalg.
+        code.writeline(
+            "block1 = min(triton.next_power_of_2(N), " f"{FAST_TRAILING_BLOCK})"
+        )
+        code.writeline("g0 = min(M, max_programs)")
+        code.writeline("grid = (")
+        with code.indent():
+            code.writeline("g0,")
+            code.writeline("min(triton.cdiv(N, block1), max(1, max_programs // g0)),")
+        code.writeline(")")
+        code.newline()
+        code.writeline(f"{kernel_name}[grid](")
+        with code.indent():
+            args = ["input,"]
+            args += [f"indices[{i}]," for i in range(indices_len)]
+            args += ["values,"]
+            args += [f"input_shape[{i}]," for i in range(inp_rank)]
+            args += [f"indices[{i}].shape[0]," for i in range(indices_len)]
+            args += [f"input_stride[{i}]," for i in range(inp_rank)]
+            args += [f"indices{i}_stride[0]," for i in range(indices_len)]
+            args += ["values_stride[0],", "values_stride[1],"]
+            args += ["M,", "N,", "accumulate==True,"]
+            code.writelines(args)
+            code.writeline("BLOCK_SIZE1=block1,")
+        code.writeline(")")
+        code.writeline("return input")
+    code.newline()
+    code.newline()
+    return code
+
+
+def generate_rowwise_code_ascend(
+    indices_len: int, wrapper_name: str, kernel_name: str, code: IndentedBuffer
+):
+    code = generate_imports(code)
+    generate_index_put_rowwise_kernel(indices_len, kernel_name, code)
+    generate_index_put_rowwise_wrapper(indices_len, wrapper_name, kernel_name, code)
+    return code
+
+
 def generate_code_ascend(
     inputs: Tuple[Any],
     wrapper_name: str,
@@ -270,23 +445,31 @@ class AscendIndexPutFunction:
     def __init__(self):
         self.overloads = {}
 
-    def arg_key(self, *args):
-        inp, tensor_indices = args[0], args[1]
+    def arg_key(self, inp, tensor_indices, rowwise):
         indices_len = len(tensor_indices)
         index_rank = 0 if indices_len == 0 else tensor_indices[0].ndim
-        return f"inp_rank_{inp.ndim}_indices_len_{indices_len}_index_rank_{index_rank}"
+        key = f"inp_rank_{inp.ndim}_indices_len_{indices_len}_index_rank_{index_rank}"
+        return key + "_rowwise" if rowwise else key
 
-    def __call__(self, inp, tensor_indices, values, accumulate):
-        key = self.arg_key(inp, tensor_indices, values)
+    def __call__(self, inp, tensor_indices, values, accumulate, rowwise=False):
+        key = self.arg_key(inp, tensor_indices, rowwise)
         overload = self.overloads.get(key)
         if overload is None:
             code = IndentedBuffer()
-            code = generate_code_ascend(
-                (inp, tensor_indices, values),
-                "_index_put_wrapper",
-                "_index_put_jit_function",
-                code,
-            )
+            if rowwise:
+                code = generate_rowwise_code_ascend(
+                    len(tensor_indices),
+                    "_index_put_wrapper",
+                    "_index_put_rowwise_jit_function",
+                    code,
+                )
+            else:
+                code = generate_code_ascend(
+                    (inp, tensor_indices, values),
+                    "_index_put_wrapper",
+                    "_index_put_jit_function",
+                    code,
+                )
             file_name = f"index_put_ascend_{key}.py"
             file_path = code_cache_dir() / file_name
             write_atomic(file_path, code.getvalue())
@@ -395,6 +578,83 @@ def _preprocess(inp, indices, values):
     return inp_view, tensors, values, slice_shape
 
 
+def _fold_stride(tensor, start):
+    """The stride a fold of ``tensor``'s dimensions from ``start`` on would
+    have, or ``None`` when they cannot be folded without copying.
+
+    Dimensions fold when they form one uniformly strided run (the usual
+    contiguous case, and a strided slice of one), or when every one of them is
+    a stride-0 broadcast, which folds to stride 0.
+    """
+    shape, stride, ndim = tensor.shape, tensor.stride(), tensor.ndim
+    if ndim - start <= 1:
+        return None
+    if all(stride[d] == 0 for d in range(start, ndim)):
+        return 0
+    # A size-1 dimension carries an arbitrary stride, so start from the
+    # innermost dimension that actually spans something.
+    inner = next((d for d in range(ndim - 1, start - 1, -1) if shape[d] != 1), None)
+    if inner is None:
+        return 1
+    expected = stride[inner]
+    for d in range(inner, start - 1, -1):
+        if shape[d] == 1:
+            continue
+        if stride[d] != expected:
+            return None
+        expected *= shape[d]
+    return stride[inner]
+
+
+def _fold(tensor, start, folded_size, folded_stride):
+    return tensor.as_strided(
+        list(tensor.shape[:start]) + [folded_size],
+        list(tensor.stride()[:start]) + [folded_stride],
+        tensor.storage_offset(),
+    )
+
+
+def _fold_trailing(inp_view, values, slice_shape):
+    """Collapse the sliced dimensions into one, as views.
+
+    Only applied when the result is something the row-wise kernel can take --
+    folding also reshapes the launch of the shared kernel, and that would move
+    the order its atomics land in for cases the row-wise kernel then declines.
+    The input is written through, so a copy would land in the wrong place;
+    both operands have to fold as views or the fold is dropped.
+    """
+    if len(slice_shape) <= 1:
+        return inp_view, values, slice_shape
+    lead = inp_view.ndim - len(slice_shape)
+    inp_stride = _fold_stride(inp_view, lead)
+    val_stride = _fold_stride(values, values.ndim - len(slice_shape))
+    if inp_stride != 1 or val_stride != 1:
+        return inp_view, values, slice_shape
+    folded = math.prod(slice_shape)
+    return (
+        _fold(inp_view, lead, folded, inp_stride),
+        _fold(values, values.ndim - len(slice_shape), folded, val_stride),
+        [folded],
+    )
+
+
+def _rowwise_eligible(inp_view, tensors, values, slice_shape):
+    """Whether the put is a row copy the scalar-base kernel can take.
+
+    It needs exactly one sliced dimension and rank-1 indices, so a row is one
+    contiguous run addressed from a scalar base, and it needs that run to be
+    contiguous on both sides. A ``values`` broadcast along the row has
+    ``stride(-1) == 0``, which collapses the load to a single address and does
+    not survive TritonToLinalg, so those keep the shared kernel.
+    """
+    return (
+        len(slice_shape) == 1
+        and tensors[0].ndim == 1
+        and inp_view.stride(-1) == 1
+        and values.stride(-1) == 1
+    )
+
+
 def _launch(inp_view, tensors, values, slice_shape, accumulate):
     """Launch the capped kernel, or skip it when there is nothing to write.
 
@@ -405,7 +665,11 @@ def _launch(inp_view, tensors, values, slice_shape, accumulate):
     if tensors[0].numel() == 0 or math.prod(slice_shape) == 0:
         logger.debug("GEMS_ASCEND INDEX_PUT empty, nothing to write")
         return
-    _ascend_index_put_func(inp_view, tensors, values, accumulate)
+    folded = _fold_trailing(inp_view, values, slice_shape)
+    if _rowwise_eligible(folded[0], tensors, folded[1], folded[2]):
+        _ascend_index_put_func(folded[0], tensors, folded[1], accumulate, True)
+        return
+    _ascend_index_put_func(inp_view, tensors, values, accumulate, False)
 
 
 def index_put_(inp, indices, values, accumulate=False):

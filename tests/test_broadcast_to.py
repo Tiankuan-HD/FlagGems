@@ -262,6 +262,56 @@ def test_broadcast_to_result_feeds_other_ops(src_shape, target_shape):
 
 
 @pytest.mark.broadcast_to
+@pytest.mark.parametrize(
+    "src_shape,target_shape",
+    [((1, 8), (4, 8)), ((8, 1), (8, 4)), ((3, 5), (3, 5)), ((), (2, 3))],
+)
+def test_broadcast_to_write_through_matches_aten(src_shape, target_shape):
+    """Writing through the result.
+
+    A view shares storage with its input, so a write through the result lands
+    in the source; a materialized copy would swallow it. torch does the former.
+    Rather than asserting either behaviour, make the same write on both and
+    require result and source to come out byte-identical, so the test keeps
+    holding whichever way torch resolves the op.
+    """
+    base = _ramp(src_shape, torch.float32)
+    gems_inp, ref_inp = base.clone(), base.clone()
+    gems_out = flag_gems.broadcast_to(gems_inp, target_shape)
+    ref_out = torch.broadcast_to(ref_inp, target_shape)
+
+    # Fill the first slice. On a broadcast axis several output positions alias
+    # one element, but the value written is the same, so the result is still
+    # well defined.
+    gems_out[0].fill_(-7.0)
+    ref_out[0].fill_(-7.0)
+
+    _assert_same_bits(gems_out, ref_out)
+    _assert_same_bits(gems_inp, ref_inp)
+
+
+@pytest.mark.broadcast_to
+@pytest.mark.parametrize(
+    "src_shape,target_shape", [((1, 8), (4, 8)), ((8, 1), (8, 4))]
+)
+def test_broadcast_to_tracks_later_input_writes_like_aten(src_shape, target_shape):
+    """The other direction: mutate the input after broadcasting.
+
+    A view reflects the change, a copy does not. Compare against torch instead
+    of fixing one answer.
+    """
+    base = _ramp(src_shape, torch.float32)
+    gems_inp, ref_inp = base.clone(), base.clone()
+    gems_out = flag_gems.broadcast_to(gems_inp, target_shape)
+    ref_out = torch.broadcast_to(ref_inp, target_shape)
+
+    gems_inp.fill_(3.5)
+    ref_inp.fill_(3.5)
+
+    _assert_same_bits(gems_out, ref_out)
+
+
+@pytest.mark.broadcast_to
 def test_broadcast_to_is_repeatable():
     inp = _ramp((1, 257), torch.float32)
     first = flag_gems.broadcast_to(inp, (131, 257))

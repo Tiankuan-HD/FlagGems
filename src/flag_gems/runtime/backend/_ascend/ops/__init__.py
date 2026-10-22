@@ -34,6 +34,7 @@ from .attention import (
 )
 from .baddbmm import baddbmm
 from .bmm import bmm
+from .broadcast_to import broadcast_to
 from .cat import cat, cat_out
 from .cholesky_solve import cholesky_solve, cholesky_solve_out
 from .concat import concat
@@ -206,6 +207,7 @@ __all__ = [
     "argsort",
     "baddbmm",
     "bmm",
+    "broadcast_to",
     "cat",
     "cat_out",
     "cholesky_solve",

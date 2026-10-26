@@ -36,6 +36,56 @@ def test_rms_norm():
     bench.run()
 
 
+@pytest.mark.rms_norm
+def test_rms_norm_backward():
+    def rms_norm_input_fn(shape, dtype, device):
+        _, N = shape
+        inp = torch.randn(shape, dtype=dtype, device=device)
+        weight = torch.randn(N, dtype=dtype, device=device)
+        yield inp, (N,), weight
+
+    # The benchmark framework enables gradients for inp and weight, builds
+    # the forward graph once, and times only autograd.grad for dx and dw.
+    bench = base.GenericBenchmark2DOnly(
+        op_name="rms_norm",
+        input_fn=rms_norm_input_fn,
+        torch_op=torch.nn.functional.rms_norm,
+        is_backward=True,
+    )
+    bench.set_gems(flag_gems.rms_norm)
+    bench.run()
+
+
+@pytest.mark.rms_norm
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend NPU baseline")
+def test_rms_norm_backward_npu():
+    import torch_npu
+
+    # Use the backward entry bound to the registered Ascend RMSNorm API.
+    gems_backward = flag_gems.rms_norm.__globals__["rms_norm_backward"]
+
+    def rms_norm_backward_input_fn(shape, dtype, device):
+        _, N = shape
+        inp = torch.randn(shape, dtype=dtype, device=device)
+        grad = torch.randn_like(inp)
+        weight = torch.randn(N, dtype=dtype, device=device)
+        # Saved forward statistics are prepared outside the timed region.
+        inv_rms = torch_npu.npu_rms_norm(inp, weight, epsilon=1e-5)[1]
+        yield grad, inp, weight, inv_rms
+
+    def gems_op(grad, inp, weight, inv_rms):
+        return gems_backward(grad, inp, inv_rms, (inp.shape[-1],), weight)
+
+    # These are already backward operators: do not wrap them in autograd.grad.
+    bench = base.GenericBenchmark2DOnly(
+        op_name="rms_norm_backward_npu",
+        input_fn=rms_norm_backward_input_fn,
+        torch_op=torch_npu.npu_rms_norm_backward,
+    )
+    bench.set_gems(gems_op)
+    bench.run()
+
+
 GROUP_SIZE = 128
 
 

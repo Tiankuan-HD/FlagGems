@@ -14,6 +14,8 @@
 
 import logging
 import math
+import os
+from functools import lru_cache
 
 import torch
 import triton
@@ -32,46 +34,120 @@ logger = logging.getLogger(__name__)
 # the kernel, see triton-ascend docs migration_guide/migrate_from_gpu.md.
 MAX_CORE_DIM = 65535
 
+# 0：自动选择；其他值：强制指定，供独立测试使用。
+_RMS_FWD_BLOCK_M = int(os.getenv("FG_RMS_FWD_BLOCK_M", "0"))
+_RMS_FWD_BLOCK_M_SUB = int(os.getenv("FG_RMS_FWD_BLOCK_M_SUB", "0"))
+
+# A conservative live-array budget, NOT the hardware UB capacity. Reserve room
+# for compiler temporaries/multibuffering; warmup below checks the actual UB use.
+_RMS_FWD_ARRAY_BUDGET_BYTES = 144 * 1024
+_RMS_FWD_TILE_CACHE = {}
+
+# Ascend limits the product of all launch-grid dimensions.
+_ASCEND_MAX_CORE_DIM = 65535
+
+
+def _floor_power_of_two(value):
+    return 1 << (max(1, value).bit_length() - 1)
+
+
+@lru_cache(maxsize=None)
+def _rms_norm_vector_cores(device_index):
+    cores = int(torch_device_fn.get_device_properties(device_index).vector_core_num)
+    if cores < 1:
+        raise ValueError("RMSNorm requires a positive vector core count")
+    return cores
+
+
+def _select_rms_norm_fwd_tiles(M, N, x_bytes, w_bytes, vector_cores,
+                               block_m=0, block_m_sub=0):
+    """Compute tiles without enumerating shapes; explicit test overrides win."""
+    for name, value in (("BLOCK_M", block_m), ("BLOCK_M_SUB", block_m_sub)):
+        if value < 0 or (value and value & (value - 1)):
+            raise ValueError(f"FG_RMS_FWD_{name} must be 0 or a positive power of two")
+
+    block_size = min(triton.next_power_of_2(N), 4096)
+    # Approximate three FP32 arrays plus input/output storage per tile element.
+    # Weight storage is per column, not per row. This is an estimate, not a
+    # compiler liveness model; only compilation can establish actual UB use.
+    row_bytes = block_size * (3 * 4 + 2 * x_bytes)
+    available = max(row_bytes, _RMS_FWD_ARRAY_BUDGET_BYTES - block_size * w_bytes)
+    resident_rows = _floor_power_of_two(available // row_bytes)
+
+    # Keep at least one wave of row tiles when M permits. A logical tile may
+    # process two resident subtiles sequentially, without doubling live arrays.
+    parallel_rows = _floor_power_of_two(max(1, M // vector_cores))
+    if block_m == 0:
+        block_m = min(2 * resident_rows, parallel_rows)
+        if block_m_sub:
+            block_m = max(block_m, block_m_sub)
+    if block_m_sub == 0:
+        block_m_sub = min(resident_rows, block_m)
+    if block_m_sub > block_m:
+        raise ValueError("FG_RMS_FWD_BLOCK_M_SUB must not exceed BLOCK_M")
+    return block_size, block_m, block_m_sub
+
+
+
 
 @libentry()
-@triton.jit(do_not_specialize=["eps", "M"])
+@triton.jit(do_not_specialize=["eps"])
 def rms_norm_kernel(
-    Y,  # pointer to the output
-    INV_RMS,  # pointer to inverse rms
-    X,  # pointer to the input
-    W,  # pointer to the weights
+    Y,
+    INV_RMS,
+    X,
+    W,
     y_stride_r,
     y_stride_c,
-    x_stride_r,  # how much to increase the pointer when moving by 1 row
-    x_stride_c,  # how much to increase the pointer when moving by 1 col
-    M,  # number of rows in X
-    N,  # number of columns in X
-    eps,  # epsilon to avoid division by zero
+    x_stride_r,
+    x_stride_c,
+    M,
+    N,
+    eps,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr = 1,
+    BLOCK_M_SUB: tl.constexpr = 0,
 ):
-    # The grid is capped at MAX_CORE_DIM, so each program handles several rows.
-    for row in range(ext.program_id(0), M, ext.num_programs(0)):
-        x_row = X + row * x_stride_r
-        y_row = Y + row * y_stride_r
+    # Logical rows per program and resident rows are independently configurable.
+    ROWS_PER_SUB: tl.constexpr = BLOCK_M if BLOCK_M_SUB == 0 else BLOCK_M_SUB
+    row_offsets = tl.arange(0, ROWS_PER_SUB)
+    num_row_tiles = tl.cdiv(M, BLOCK_M)
+    for tile in range(ext.program_id(0), num_row_tiles, ext.num_programs(0)):
+        for row_sub in range(0, BLOCK_M, ROWS_PER_SUB):
+            rows = tile * BLOCK_M + row_sub + row_offsets
+            row_mask = (rows < M) & (row_sub + row_offsets < BLOCK_M)
+            # Keep only the current sub-block's row statistics live.
+            var = tl.full((ROWS_PER_SUB,), 0.0, tl.float32)
+            for off in range(0, N, BLOCK_SIZE):
+                cols = off + tl.arange(0, BLOCK_SIZE)
+                mask = row_mask[:, None] & (cols[None, :] < N)
+                x = tl.load(
+                    X + rows[:, None] * x_stride_r + cols[None, :] * x_stride_c,
+                    mask,
+                    other=0.0,
+                ).to(tl.float32)
+                var += tl.sum(x * x / N, axis=1)
 
-        var = 0.0
-        for off in range(0, N, BLOCK_SIZE):
-            cols = off + tl.arange(0, BLOCK_SIZE)
-            mask = cols < N
-            x = tl.load(x_row + cols, mask, other=0.0).to(tl.float32)
-            var += tl.sum(x * x / N)
+            rrms = 1 / tl.sqrt(var + eps)
 
-        rrms = 1 / tl.sqrt(var + eps)
+            for off in range(0, N, BLOCK_SIZE):
+                cols = off + tl.arange(0, BLOCK_SIZE)
+                mask = row_mask[:, None] & (cols[None, :] < N)
+                x = tl.load(
+                    X + rows[:, None] * x_stride_r + cols[None, :] * x_stride_c,
+                    mask,
+                    other=0.0,
+                ).to(tl.float32)
+                w = tl.load(W + cols, cols < N, other=0.0)
+                y_fp32 = x * rrms[:, None] * w[None, :].to(tl.float32)
+                y = y_fp32.to(Y.dtype.element_ty)
+                tl.store(
+                    Y + rows[:, None] * y_stride_r + cols[None, :] * y_stride_c,
+                    y,
+                    mask=mask,
+                )
 
-        for off in range(0, N, BLOCK_SIZE):
-            cols = off + tl.arange(0, BLOCK_SIZE)
-            mask = cols < N
-            x = tl.load(x_row + cols, mask, other=0.0).to(tl.float32)
-            w = tl.load(W + cols, mask, other=0.0)
-            y = (x * rrms).to(Y.dtype.element_ty) * w
-            tl.store(y_row + cols * y_stride_c, y, mask=mask)
-
-        tl.store(INV_RMS + row, rrms)
+            tl.store(INV_RMS + rows, rrms, mask=row_mask)
 
 
 @libentry()
@@ -207,29 +283,62 @@ def rms_norm(x, normalized_shape, weight, eps=1e-5):
 
 
 def rms_norm_forward(x, normalized_shape, weight, eps=1e-5):
-    """rms_norm without autograd, returning (y, inv_rms).
-
-    TransformerEngine's FlagOS backend calls this entry point directly, so it
-    must carry the same capped launch as RmsNorm.forward or that path still
-    overflows coreDim.
-    """
     logger.debug("GEMS_ASCEND RMS_NORM_FORWARD")
     dim = x.ndim - len(normalized_shape)
     M = math.prod(x.shape[:dim])
     N = math.prod(normalized_shape)
-
-    BLOCK_SIZE = min(triton.next_power_of_2(N), 12064)
 
     x = x.contiguous()
     weight = weight.contiguous()
     y = torch.empty_like(x)
     inv_rms = torch.empty((M,), device=x.device, dtype=torch.float32)
 
-    with torch_device_fn.device(x.device):
-        rms_norm_kernel[min(M, MAX_CORE_DIM),](
-            y, inv_rms, x, weight, N, 1, N, 1, M, N, eps, BLOCK_SIZE
-        )
-
+    if M:
+        device_index = x.device.index
+        vector_cores = _rms_norm_vector_cores(device_index)
+        # This cache is populated at runtime after successful compilation;
+        # it contains no hand-written shape/configuration pairs.
+        key = (device_index, M, N, x.dtype, weight.dtype, type(eps),
+               x.data_ptr() % 16, weight.data_ptr() % 16,
+               _RMS_FWD_BLOCK_M, _RMS_FWD_BLOCK_M_SUB)
+        tiles = _RMS_FWD_TILE_CACHE.get(key)
+        with torch_device_fn.device(x.device):
+            if tiles is None:
+                block_size, block_m, block_m_sub = _select_rms_norm_fwd_tiles(
+                    M, N, x.element_size(), weight.element_size(), vector_cores,
+                    _RMS_FWD_BLOCK_M, _RMS_FWD_BLOCK_M_SUB,
+                )
+                automatic = _RMS_FWD_BLOCK_M == 0 and _RMS_FWD_BLOCK_M_SUB == 0
+                while True:
+                    grid = (min(triton.cdiv(M, block_m), _ASCEND_MAX_CORE_DIM),)
+                    try:
+                        # Compile only: do not launch a potentially oversized tile.
+                        rms_norm_kernel.fn.warmup(
+                            y, inv_rms, x, weight, N, 1, N, 1, M, N, eps,
+                            block_size, block_m, block_m_sub, grid=grid,
+                        )
+                        break
+                    except Exception as exc:
+                        # Other compiler errors and all execution errors propagate.
+                        if not automatic or "ub overflow" not in str(exc).lower():
+                            raise
+                        previous = (block_size, block_m, block_m_sub)
+                        if block_m_sub > 1:
+                            block_m_sub //= 2
+                        elif block_size > 1:
+                            block_size //= 2
+                        else:
+                            raise
+                        logger.warning("RMSNorm UB compile backoff: %s -> %s",
+                                       previous, (block_size, block_m, block_m_sub))
+                tiles = (block_size, block_m, block_m_sub)
+                _RMS_FWD_TILE_CACHE[key] = tiles
+            block_size, block_m, block_m_sub = tiles
+            grid = (min(triton.cdiv(M, block_m), _ASCEND_MAX_CORE_DIM),)
+            rms_norm_kernel[grid](
+                y, inv_rms, x, weight, N, 1, N, 1, M, N, eps,
+                block_size, block_m, block_m_sub,
+            )
     return y, inv_rms
 
 

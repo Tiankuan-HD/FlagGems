@@ -166,6 +166,10 @@ def sum_dim_kernel_non_inner(
         input_ptr.dtype.element_ty == tl.bfloat16
     ):
         cdtype = tl.float32
+    elif tl.constexpr(input_ptr.dtype.element_ty == tl.int1):
+        # Ascend vadd cannot accumulate bools. Count in int64 before storing
+        # to the requested output dtype, just as in the full-reduction path.
+        cdtype = tl.int64
     else:
         cdtype = input_ptr.dtype.element_ty
 
@@ -213,6 +217,8 @@ def sum_dim_kernel_inner(
         input_ptr.dtype.element_ty == tl.bfloat16
     ):
         cdtype = tl.float32
+    elif tl.constexpr(input_ptr.dtype.element_ty == tl.int1):
+        cdtype = tl.int64
     else:
         cdtype = input_ptr.dtype.element_ty
 
@@ -253,6 +259,8 @@ def sum_dim_kernel(
         inp.dtype.element_ty == tl.bfloat16
     ):
         cdtype = tl.float32
+    elif tl.constexpr(inp.dtype.element_ty == tl.int1):
+        cdtype = tl.int64
     else:
         cdtype = inp.dtype.element_ty
 

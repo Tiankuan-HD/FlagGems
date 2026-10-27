@@ -121,6 +121,7 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         "stride_cm",
         "stride_cn",
         "DOT_PAD_ONLY_K",
+        "BIAS_IS_VECTOR",
     ],
     prune_configs_by={"early_config_prune": _prune_addmm_configs},
 )
@@ -444,6 +445,17 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
                 and N >= 128
                 and N % 16 == 0
                 and K > 0
+            ),
+            sync_solver=(
+                False
+                if (
+                    bias_is_vector
+                    and mat1.dtype == mat2.dtype == torch.bfloat16
+                    and mat1.stride(1) == mat2.stride(0) == 1
+                    and mat1.stride(0) >= K
+                    and mat2.stride(1) >= K
+                )
+                else None
             ),
         )
     return out

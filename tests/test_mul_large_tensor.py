@@ -66,10 +66,6 @@ from . import accuracy_utils as utils
         pytest.param(
             1024 * 1024 * 1024,
             "Very large tensor (1G elements, 4GB)",
-            marks=pytest.mark.skipif(
-                torch.npu.get_device_properties(0).total_memory < 8 * 1024**3,
-                reason="Requires at least 8GB device memory",
-            ),
         ),
     ],
 )
@@ -77,6 +73,13 @@ from . import accuracy_utils as utils
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_mul_large_tensor_scalar(n_elements, description, scalar, dtype):
     """Test mul operation with large tensors that trigger coreDim > 65535."""
+    if n_elements == 1024 * 1024 * 1024:
+        npu = getattr(torch, "npu", None)
+        if npu is None or not npu.is_available():
+            pytest.skip("Requires an Ascend NPU with at least 8GB device memory")
+        if npu.get_device_properties(0).total_memory < 8 * 1024**3:
+            pytest.skip("Requires at least 8GB device memory")
+
     # Create large tensor
     inp = torch.randn(n_elements, dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, True)

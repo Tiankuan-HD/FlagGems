@@ -24,6 +24,7 @@ from .full import full
 from .full_like import full_like
 from .gcd_ import gcd_
 from .greater_equal import greater_equal_
+from .grouped_mm_w8a8 import grouped_mm_w8a8
 from .groupnorm import group_norm
 from .gru import gru, gru_data
 from .gt_scalar_ import gt_scalar_
@@ -80,6 +81,7 @@ except ImportError:
     # import normally and MetaX behaviour is unchanged.
     pass
 from ._make_dep_token import _make_dep_token
+from .mode import mode
 from .mv import mv
 from .mvlgamma import mvlgamma
 from .mvlgamma_ import mvlgamma_
@@ -178,6 +180,7 @@ __all__ = [
     "gcd_",
     "greater_equal_",
     "group_norm",
+    "grouped_mm_w8a8",
     "gru",
     "gru_data",
     "gt_scalar_",
@@ -237,6 +240,7 @@ __all__ = [
     "mm_out",
     "mm_w8a8_int8",
     "mm_w8a8_int8_out",
+    "mode",
     "mv",
     "mvlgamma",
     "mvlgamma_",

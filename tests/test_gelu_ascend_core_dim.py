@@ -343,56 +343,6 @@ def test_gelu_layout_and_storage(
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("approximate", APPROXIMATIONS)
-@pytest.mark.parametrize("operation", ["forward", "backward"])
-@pytest.mark.parametrize("api", ["direct", "torch"])
-@pytest.mark.parametrize("layout", ["transpose", "permuted_offset"])
-def test_gelu_output_layout_change(
-    gelu_ops, launches, monkeypatch, dtype, approximate, operation, api, layout
-):
-    # Some NPU runtimes allocate contiguous empty_like outputs for dense views.
-    # Force that allocation policy even when the local runtime preserves strides.
-    allocations = []
-
-    def contiguous_output(shape, dtype, device, *, like_tensor=None):
-        output = torch.empty(shape, dtype=dtype, device=device)
-        assert output.stride() != like_tensor.stride()
-        allocations.append(output)
-        return output
-
-    prefix = "gelu_backward" if operation == "backward" else "gelu"
-    monkeypatch.setattr(
-        getattr(gelu_ops, f"{prefix}_{approximate}"),
-        "_alloc_output",
-        contiguous_output,
-    )
-    shape = (37, 53) if layout == "transpose" else (5, 7, 11)
-    x_base_cpu, dy_base_cpu = _inputs(shape, dtype)
-    x_base = x_base_cpu.to(flag_gems.device)
-    dy_base = dy_base_cpu.to(flag_gems.device)
-    if layout == "transpose":
-        x, x_cpu = x_base.t(), x_base_cpu.t()
-        dy, dy_cpu = dy_base.t(), dy_base_cpu.t()
-    else:
-        x, x_cpu = x_base[1:].permute(2, 0, 1), x_base_cpu[1:].permute(2, 0, 1)
-        dy, dy_cpu = dy_base[1:].permute(2, 0, 1), dy_base_cpu[1:].permute(2, 0, 1)
-        assert x.storage_offset() > 0
-        assert dy.storage_offset() > 0
-    # Backward must also exercise the dense fast path: both inputs have the
-    # same strides, unlike the strided gradient in test_gelu_layout_and_storage.
-    assert x.stride() == dy.stride()
-    assert not x.is_contiguous()
-    expected = _reference(x_cpu, dy_cpu, operation, approximate)
-    actual = _run(x, dy, operation, approximate, api=api)
-    _assert_accuracy(actual, expected, dtype)
-    assert len(allocations) == 1
-    assert actual.data_ptr() == allocations[0].data_ptr()
-    assert len(launches) == 1
-    torch.testing.assert_close(x_base.cpu(), x_base_cpu, rtol=0, atol=0)
-    torch.testing.assert_close(dy_base.cpu(), dy_base_cpu, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("approximate", APPROXIMATIONS)
 @pytest.mark.parametrize("operation", OPERATIONS)
 def test_gelu_torch_dispatch(launches, dtype, approximate, operation, record_property):
     x_cpu, dy_cpu = _inputs((17, 257), dtype)

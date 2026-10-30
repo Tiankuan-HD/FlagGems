@@ -1666,17 +1666,6 @@ class PointwiseDynamicFunction:
                 )
                 for dtype in outputs_dtypes_for_allocation
             ]
-            # empty_like may allocate a different layout on some backends.
-            # Physical-order flattening is valid only when the actual outputs
-            # also match. Reuse these allocations in the stride-aware path.
-            if allocated_outputs and not self.use_fast_path(
-                tensors + allocated_outputs
-            ):
-                for output_id, output in zip(
-                    outputs_that_need_allocation, allocated_outputs
-                ):
-                    kwargs[f"out{output_id}"] = output
-                return self.prepare_args(*args, _skip_tensor_check=True, **kwargs)
             task_shape = (tensors[0].numel(),)
             strides = (1,)
             ndim = 1

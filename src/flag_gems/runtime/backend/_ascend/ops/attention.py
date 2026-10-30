@@ -21,11 +21,11 @@ import triton
 import triton.language as tl
 
 from flag_gems.config import use_c_extension
-from flag_gems.ops.flash_api import mha_fwd
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
+from flag_gems.utils.shape_utils import broadcasted_stride
 
-from .flash_api import mha_varlan_fwd
+from .flash_api import mha_fwd, mha_varlan_fwd, mha_varlan_fwd_opt
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ def _attn_fwd_inner(
     fp8_v: tl.constexpr,
     HAS_ATTN_MASK: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
+    HEAD_DIM_ACTUAL: tl.constexpr,
 ):
     # Align both causal regions to the same KV tile boundary. When N > M,
     # starting the masked region at the Q tile would overlap the last full
@@ -75,6 +76,7 @@ def _attn_fwd_inner(
         mask_block_ptr += lo * stride_attn_mask_kv_seqlen
 
     LOG2E = 1.44269504  # log2(e) constant
+    head_mask = tl.arange(0, HEAD_DIM) < HEAD_DIM_ACTUAL
 
     # loop over key, value and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
@@ -84,10 +86,18 @@ def _attn_fwd_inner(
         # Load along the contiguous head dimension before transposing for QK.
         # A directly loaded [D, N] tile lowers poorly on the Ascend backend.
         key = tl.trans(
-            tl.load(K_block_ptr, mask=kv_load_mask[:, None], other=0.0)
+            tl.load(
+                K_block_ptr,
+                mask=kv_load_mask[:, None] & head_mask[None, :],
+                other=0.0,
+            )
         )
         if PRE_LOAD_V:
-            value = tl.load(V_block_ptr, mask=kv_load_mask[:, None], other=0.0)
+            value = tl.load(
+                V_block_ptr,
+                mask=kv_load_mask[:, None] & head_mask[None, :],
+                other=0.0,
+            )
 
         qk = tl.dot(query, key, allow_tf32=False)
         # incase not divisible.
@@ -129,7 +139,11 @@ def _attn_fwd_inner(
         acc = acc * alpha[:, None]
         # update acc
         if not PRE_LOAD_V:
-            value = tl.load(V_block_ptr, mask=kv_load_mask[:, None], other=0.0)
+            value = tl.load(
+                V_block_ptr,
+                mask=kv_load_mask[:, None] & head_mask[None, :],
+                other=0.0,
+            )
         if fp8_v:
             p = p.to(tl.float8e5)
         else:
@@ -185,6 +199,7 @@ def _attn_fwd(
     Q_CTX,
     KV_CTX,
     HEAD_DIM: tl.constexpr,
+    HEAD_DIM_ACTUAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     STAGE: tl.constexpr,
@@ -209,6 +224,7 @@ def _attn_fwd(
     )
 
     offs_headsize = tl.arange(0, HEAD_DIM)
+    head_mask = offs_headsize < HEAD_DIM_ACTUAL
 
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -263,7 +279,9 @@ def _attn_fwd(
     qk_scale = sm_scale
     # qk_scale *= 1.44269504  # 1/log(2)
     # load query: it will stay in SRAM throughout
-    query = tl.load(Q_block_ptr, mask=q_load_mask[:, None], other=0.0)
+    query = tl.load(
+        Q_block_ptr, mask=q_load_mask[:, None] & head_mask[None, :], other=0.0
+    )
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
@@ -292,6 +310,7 @@ def _attn_fwd(
             V.dtype.element_ty == tl.float8e5,
             HAS_ATTN_MASK,
             PRE_LOAD_V,
+            HEAD_DIM_ACTUAL,
         )
     # stage 2: on-band
     if STAGE & 2:
@@ -321,13 +340,18 @@ def _attn_fwd(
             V.dtype.element_ty == tl.float8e5,
             HAS_ATTN_MASK,
             PRE_LOAD_V,
+            HEAD_DIM_ACTUAL,
         )
     # epilogue
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * Q_CTX + offs_m
     tl.store(m_ptrs, m_i, mask=q_load_mask)
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask=q_load_mask[:, None])
+    tl.store(
+        O_block_ptr,
+        acc.to(Out.type.element_ty),
+        mask=q_load_mask[:, None] & head_mask[None, :],
+    )
 
 
 @triton.jit
@@ -643,6 +667,13 @@ def _attn_bwd(
             num_steps,
             MASK=IS_CAUSAL,
         )
+        if IS_CAUSAL:
+            # Fully masked KV tiles have a zero-trip loop. Explicitly zero
+            # their gradients: Ascend may leave the dot accumulators stale
+            # when the loop does not execute.
+            has_query = offs_n[:, None] < Q_CTX
+            dk = tl.where(has_query, dk, 0.0)
+            dv = tl.where(has_query, dv, 0.0)
         tl.store(DK + kv_ptrs, dk * sm_scale, mask=mask_n[:, None])
         tl.store(DV + kv_ptrs, dv, mask=mask_n[:, None])
 
@@ -663,7 +694,7 @@ def scaled_dot_product_attention_forward(
     # when v is in float8_e5m2 it is transposed.
     HEAD_DIM_V = value.shape[-1]
     assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-    assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+    assert 16 <= HEAD_DIM_K <= 256
     assert dropout_p == 0.0, "Currenty only support dropout_p=0.0"
 
     o = torch.empty_like(query, dtype=value.dtype)
@@ -674,6 +705,11 @@ def scaled_dot_product_attention_forward(
         sm_scale = 1.0 / (HEAD_DIM_K**0.5)
     else:
         sm_scale = scale
+
+    # Keep scaling and tensor strides based on the real head dimension. Only
+    # the kernel tile is padded; masked loads supply zeros for the extra lanes.
+    HEAD_DIM_ACTUAL = HEAD_DIM_K
+    HEAD_DIM_K = triton.next_power_of_2(HEAD_DIM_K)
 
     q_head_num = query.shape[1]
     kv_head_num = key.shape[1]
@@ -692,10 +728,18 @@ def scaled_dot_product_attention_forward(
         HAS_ATTN_MASK = True
         if attn_mask.dtype == torch.bool:
             attn_mask = attn_mask.to(query.dtype) * -1.0e6
-        stride_attn_mask_batch = attn_mask.stride(0)
-        stride_attn_mask_head = attn_mask.stride(1)
-        stride_attn_mask_q_seqlen = attn_mask.stride(2)
-        stride_attn_mask_kv_seqlen = attn_mask.stride(3)
+        # The kernel indexes [B, H_q, S_q, S_k], so singleton and omitted
+        # mask dimensions must have zero stride after broadcasting.
+        (
+            stride_attn_mask_batch,
+            stride_attn_mask_head,
+            stride_attn_mask_q_seqlen,
+            stride_attn_mask_kv_seqlen,
+        ) = broadcasted_stride(
+            attn_mask.shape,
+            attn_mask.stride(),
+            (query.shape[0], q_head_num, query.shape[2], key.shape[2]),
+        )
     else:
         HAS_ATTN_MASK = False
         stride_attn_mask_batch = 1
@@ -745,6 +789,7 @@ def scaled_dot_product_attention_forward(
             query.shape[2],  #
             key.shape[2],  #
             HEAD_DIM_K,  #
+            HEAD_DIM_ACTUAL=HEAD_DIM_ACTUAL,
             STAGE=stage,  #
             HAS_ATTN_MASK=HAS_ATTN_MASK,  #
             # D=256 benefits from longer KV tiles with row-major K loads.
@@ -986,9 +1031,9 @@ def flash_attention_forward(
     disable_splitkv=False,
 ):
     logger.debug("GEMS_ASCEND FLASH_ATTENTION_FORWARD")
-    assert (
-        cumulative_sequence_length_q is None and cumulative_sequence_length_k is None
-    ), "varlen is not supported yet."
+    assert (cumulative_sequence_length_q is None) == (
+        cumulative_sequence_length_k is None
+    ), "Both cumulative lengths must be supplied"
 
     HEAD_DIM_Q, HEAD_DIM_K = query.shape[-1], key.shape[-1]
     HEAD_DIM_V = value.shape[-1]
@@ -1036,7 +1081,7 @@ def flash_attention_forward(
             max_q,
             max_k,
             dropout_p,
-            scale,
+            softmax_scale,
             False,
             is_causal,
             non_null_window_left,
@@ -1251,3 +1296,173 @@ def flash_attn_varlen_func(
         )
 
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+def flash_attn_varlen_opt_func(
+    q,
+    k,
+    v,
+    max_seqlen_q,
+    cu_seqlens_q,
+    max_seqlen_k,
+    cu_seqlens_k=None,  # only used for non-paged prefill
+    seqused_k=None,
+    q_v=None,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=None,
+    softcap=0.0,  # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    return_softmax_lse=False,
+    out=None,
+    lse=None,
+    # Dummy FA3 arguments
+    scheduler_metadata=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    s_aux=None,
+    num_splits: int = 0,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+    cp_tot_seqused_k=None,
+    fa_version: int = 2,
+):
+    """Ascend variable-length attention with optional preallocated output and LSE."""
+    if fa_version != 2:
+        raise RuntimeError("Only FA2 is implemented.")
+    if num_splits > 0:
+        raise RuntimeError("num_splits > 0 is not implemented in GEMS.")
+    if use_c_extension:
+        logger.debug("GEMS FLASH_ATTN_VARLEN_FUNC(C EXTENSION)")
+        with torch_device_fn.device(q.device):
+            out_cpp, softmax_lse = torch.ops.flag_gems.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                max_seqlen_q,
+                cu_seqlens_q,
+                max_seqlen_k,
+                cu_seqlens_k,
+                seqused_k,
+                q_v,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size,
+                softcap,
+                alibi_slopes,
+                deterministic,
+                return_attn_probs,
+                block_table,
+                return_softmax_lse,
+                out,
+                scheduler_metadata,
+                q_descale,
+                k_descale,
+                v_descale,
+                s_aux,
+                num_splits,
+                cp_world_size,
+                cp_rank,
+                cp_tot_seqused_k,
+                fa_version,
+            )
+        return (out_cpp, softmax_lse) if return_softmax_lse else out_cpp
+    else:
+        logger.debug("GEMS_ASCEND FLASH_ATTN_VARLEN_OPT_FUNC")
+        assert (
+            cu_seqlens_k is not None or seqused_k is not None
+        ), "cu_seqlens_k or seqused_k must be provided"
+        assert (
+            cu_seqlens_k is None or seqused_k is None
+        ), "cu_seqlens_k and seqused_k cannot be provided at the same time"
+        assert (
+            block_table is None or seqused_k is not None
+        ), "seqused_k must be provided if block_table is provided"
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        # custom op does not support non-tuple input
+        if window_size is None:
+            real_window_size = (-1, -1)
+        else:
+            assert len(window_size) == 2
+            real_window_size = (window_size[0], window_size[1])
+        max_seqlen_q = (
+            max_seqlen_q.item() if hasattr(max_seqlen_q, "item") else max_seqlen_q
+        )
+        max_seqlen_k = (
+            max_seqlen_k.item() if hasattr(max_seqlen_k, "item") else max_seqlen_k
+        )
+        out, q, k, v, softmax_lse, *_ = mha_varlan_fwd_opt(
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cu_seqlens_q,
+            # Paged KV uses seqused_k; cumulative K lengths are unused there.
+            cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k,
+            seqused_k,
+            None,
+            block_table,
+            alibi_slopes,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            False,
+            causal,
+            real_window_size[0],
+            real_window_size[1],
+            softcap,
+            return_softmax_lse and dropout_p > 0,
+            None,
+        )
+
+    return (out, softmax_lse) if return_softmax_lse else out
+
+
+def _flash_attention_forward(
+    query,
+    key,
+    value,
+    cumulative_sequence_length_q,
+    cumulative_sequence_length_k,
+    max_q,
+    max_k,
+    dropout_p,
+    is_causal,
+    return_debug_mask,
+    *,
+    scale=None,
+    window_size_left=None,
+    window_size_right=None,
+    seqused_k=None,
+    alibi_slopes=None,
+):
+    """Run the canonical ATen entry through the existing
+    FlashAttention implementation.
+    """
+    logger.debug("GEMS_ASCEND _FLASH_ATTENTION_FORWARD")
+    return flash_attention_forward(
+        query,
+        key,
+        value,
+        cumulative_sequence_length_q,
+        cumulative_sequence_length_k,
+        max_q,
+        max_k,
+        dropout_p,
+        is_causal,
+        return_debug_mask,
+        scale=scale,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        seqused_k=seqused_k,
+        alibi_slopes=alibi_slopes,
+    )

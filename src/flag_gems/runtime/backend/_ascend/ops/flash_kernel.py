@@ -19,13 +19,67 @@ import triton.language as tl
 
 from flag_gems.ops.flash_kernel import (
     apply_alibi,
-    apply_dropout,
     apply_mask,
     apply_softcap,
     load_from_kvcache,
     softmax_rescale,
 )
 from flag_gems.utils import libentry
+
+from .exponential import _mulhi_u32_limb
+
+
+@triton.jit
+def _attention_dropout(
+    probabilities,
+    row_idx,
+    col_start,
+    k_len,
+    bid,
+    hid,
+    seed,
+    offset,
+    keep_threshold: tl.constexpr,
+    encode_sign: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Match the shared attention RNG with 32-bit products. Ascend cannot
+    # lower its vector uint32 -> uint64 casts and 64-bit multiplications.
+    row = row_idx[:, None].to(tl.uint32)
+    columns = col_start + tl.arange(0, BLOCK_N)[None, :]
+    col = (columns // 4).to(tl.uint32)
+    low = row * k_len.to(tl.uint32)
+    high = _mulhi_u32_limb(row, k_len.to(tl.uint32))
+    subsequence_low = low + col
+    carry = ((low & col) | ((low | col) & ~subsequence_low)) >> 31
+    subsequence_high = high + carry
+    offset = offset + bid * NUM_HEADS + hid
+    k0 = (seed >> 32).to(tl.uint32)
+    k1 = seed.to(tl.uint32)
+    c0 = (offset >> 32).to(tl.uint32) + tl.full((BLOCK_M, BLOCK_N), 0, tl.uint32)
+    c1 = offset.to(tl.uint32) + tl.full((BLOCK_M, BLOCK_N), 0, tl.uint32)
+    c2 = subsequence_high
+    c3 = subsequence_low
+    for _ in tl.static_range(7):
+        hi0 = _mulhi_u32_limb(c0, 0xD2511F53)
+        lo0 = 0xD2511F53 * c0
+        hi1 = _mulhi_u32_limb(c2, 0xCD9E8D57)
+        lo1 = 0xCD9E8D57 * c2
+        c0, c1, c2, c3 = lo1 ^ c1 ^ k0, hi1, lo0 ^ c3 ^ k1, hi0
+        k0 += 0x9E3779B9
+        k1 += 0xBB67AE85
+    # Select each lane in two dimensions; join/reshape would leave unsupported
+    # four-dimensional UB buffers after the Ascend compiler's layout passes.
+    lane = columns % 4
+    random = tl.where(
+        lane == 0, c0, tl.where(lane == 1, c2, tl.where(lane == 2, c1, c3))
+    )
+    dropped = (random & 0xFF).to(tl.int32) >= keep_threshold
+    if encode_sign:
+        return tl.where(dropped, -probabilities, probabilities)
+    return tl.where(dropped, 0, probabilities).to(probabilities.dtype)
 
 
 @libentry()
@@ -116,10 +170,18 @@ def flash_varlen_fwd_kernel(
     BLOCK_K: tl.constexpr,
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
+    DENSE: tl.constexpr = False,
+    SPLIT_KV: tl.constexpr = False,
+    blocks_per_split: tl.constexpr = 0,
 ):
     m_block = tl.program_id(0)
-    bid = tl.program_id(1)
-    hid = tl.program_id(2)
+    if SPLIT_KV:
+        split_id = tl.program_id(1)
+        bid = tl.program_id(2) // h
+        hid = tl.program_id(2) % h
+    else:
+        bid = tl.program_id(1)
+        hid = tl.program_id(2)
     # num_m_blocks = tl.cdiv(seqlen_q, BLOCK_M)
 
     if is_cu_seqlens_q:
@@ -140,10 +202,12 @@ def flash_varlen_fwd_kernel(
         k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
         k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
         k_len_cache = k_eos - k_bos
-        # k_offset = k_bos * k_row_stride
+        k_offset = k_bos * k_row_stride
+        v_offset = k_bos * v_row_stride
     else:
         k_len_cache = seqlen_k
-        # k_offset = bid * k_batch_stride
+        k_offset = bid * k_batch_stride
+        v_offset = bid * v_batch_stride
 
     if is_seqused_k:
         k_len = tl.load(seqused_k_ptr + bid).to(tl.int32)
@@ -173,6 +237,10 @@ def flash_varlen_fwd_kernel(
             ),
         )
 
+    if SPLIT_KV:
+        n_block_min = max(n_block_min, split_id * blocks_per_split)
+        n_block_max = min(n_block_max, (split_id + 1) * blocks_per_split)
+
     if is_dropout:
         philox_seed = tl.load(philox_args).to(tl.uint64)
         philox_offset = tl.load(philox_args + 1).to(tl.uint64)
@@ -186,7 +254,7 @@ def flash_varlen_fwd_kernel(
     k_row_offset = (hid // h_hk_ratio) * k_head_stride
     # Shift the k, v pointers to align with the current head
     k_ptr_base = k_ptr + k_row_offset
-    v_ptr_base = v_ptr + k_row_offset
+    v_ptr_base = v_ptr + (hid // h_hk_ratio) * v_head_stride
 
     gQ = tl.make_block_ptr(
         base=q_ptr + q_offset + q_row_offset,
@@ -215,7 +283,7 @@ def flash_varlen_fwd_kernel(
 
     # Keep the same masked, row-major load layout for every KV tile on NPU.
     # This also covers padded head dimensions and tail sequence tiles.
-    n_masking_steps = n_block_max - n_block_min
+    n_masking_steps = max(0, n_block_max - n_block_min)
 
     row_idx = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
     n_block = n_block_max - 1
@@ -237,8 +305,8 @@ def flash_varlen_fwd_kernel(
             )
         else:
             start_n = n_block * BLOCK_N
-            k_ptr_seq = k_ptr_base + k_bos * k_row_stride
-            v_ptr_seq = v_ptr_base + k_bos * k_row_stride
+            k_ptr_seq = k_ptr_base + k_offset
+            v_ptr_seq = v_ptr_base + v_offset
             # The head dimension has unit stride. Ascend requires the
             # block-pointer order to match this row-major memory layout.
             gK = tl.make_block_ptr(
@@ -252,7 +320,7 @@ def flash_varlen_fwd_kernel(
             gV = tl.make_block_ptr(
                 base=v_ptr_seq,
                 shape=(k_len, d),
-                strides=(k_row_stride, 1),
+                strides=(v_row_stride, 1),
                 offsets=(start_n, 0),
                 block_shape=(BLOCK_N, BLOCK_K),
                 order=(1, 0),
@@ -296,57 +364,163 @@ def flash_varlen_fwd_kernel(
         P = P.to(v_ptr.type.element_ty)
 
         if is_dropout:
-            P = apply_dropout(
+            P = _attention_dropout(
                 P,
+                row_idx,
                 n_block * BLOCK_N,
-                m_block * BLOCK_M,
                 k_len,
                 bid,
                 hid,
                 philox_seed,
                 philox_offset,
                 p_dropout_in_uint8_t,
-                is_dropout,
-                encode_dropout_in_sign_bit=False,
+                encode_sign=return_softmax,
                 NUM_HEADS=h,
                 BLOCK_M=BLOCK_M,
                 BLOCK_N=BLOCK_N,
             )
+
+            if return_softmax:
+                p_offset = (
+                    (bid * h + hid) * seqlen_q_rounded + row_idx[:, None]
+                ) * seqlen_k_rounded + col_idx[None, :]
+                tl.store(
+                    p_ptr + p_offset,
+                    P,
+                    mask=(row_idx[:, None] < q_len) & (col_idx[None, :] < k_len),
+                )
+                P = tl.maximum(P, 0.0).to(v_ptr.type.element_ty)
 
         acc_ = tl.dot(P, bV, acc_)
         n_block -= 1
 
     # LSE
     lse = tl.where(
-        rowsum_ == 0 | (rowsum_ != rowsum_),
-        float("inf"),
+        (rowsum_ == 0) | (rowsum_ != rowsum_),
+        float("-inf") if SPLIT_KV else float("inf"),
         rowmax_ * scale_softmax + tl.log(rowsum_),
     )
-    inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
+    inv_sum = tl.where((rowsum_ == 0) | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
 
+    if is_dropout:
+        inv_sum *= rp_dropout
     acc_ *= inv_sum[:, None]
 
     out = acc_.to(o_ptr.type.element_ty)  # noqa
 
-    # Write back output
-    o_row_offset = hid * o_head_stride
+    if SPLIT_KV:
+        # Partial buffers use [split, batch, head, query, dim].
+        rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        dims = tl.arange(0, BLOCK_K)
+        partial_row = ((split_id * b + bid) * h + hid) * seqlen_q + rows
+        tl.store(
+            o_ptr + partial_row[:, None] * d + dims[None, :],
+            acc_,
+            mask=(rows[:, None] < q_len) & (dims[None, :] < d),
+        )
+        tl.store(softmax_lse_ptr + partial_row, lse, mask=rows < q_len)
+    else:
+        o_row_offset = hid * o_head_stride
+        gO = tl.make_block_ptr(
+            base=o_ptr + o_offset + o_row_offset,
+            shape=(q_len, d),
+            strides=(o_row_stride, 1),
+            offsets=(0, 0),
+            block_shape=(BLOCK_M, BLOCK_K),
+            order=(1, 0),
+        )
+        tl.store(gO.advance([m_block * BLOCK_M, 0]), out, boundary_check=(0, 1))
 
-    gO = tl.make_block_ptr(
-        base=o_ptr + o_offset + o_row_offset,
-        shape=(q_len, d),
-        strides=(o_row_stride, 1),
-        offsets=(0, 0),
-        block_shape=(BLOCK_M, BLOCK_K),
-        order=(1, 0),
-    )
-    tl.store(gO.advance([m_block * BLOCK_M, 0]), out, boundary_check=(0, 1))
+        # Dense LSE is [batch, head, query]; packed LSE is [head, total_q].
+        if DENSE:
+            lse_offset = (bid * h + hid) * seqlen_q
+        else:
+            lse_offset += hid * total_q
+        rows = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        tl.store(softmax_lse_ptr + lse_offset + rows, lse, mask=rows < q_len)
 
-    # Write back lse
-    # lse shape: [h, total_q]
-    softmax_lse_ptr += hid * total_q
-    lse_row_offset = lse_offset + m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    tl.store(
-        softmax_lse_ptr + lse_row_offset,
-        lse,
-        mask=lse_row_offset < (lse_offset + q_len),
+
+@libentry()
+@triton.jit
+def flash_fwd_splitkv_combine_kernel(
+    out_ptr,
+    lse_ptr,
+    out_splits_ptr,
+    lse_splits_ptr,
+    head_size: tl.constexpr,
+    out_split_stride,
+    lse_split_stride,
+    out_b_stride,
+    out_s_stride,
+    out_h_stride,
+    n_splits,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    q_total,
+    MAX_N_SPLITS: tl.constexpr,
+    num_heads: tl.constexpr,
+    seqlen_q: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    lse_splits_ptr += pid * BLOCK_M
+    lse_ptr += pid * BLOCK_M
+    out_splits_ptr += pid * BLOCK_M * head_size
+
+    # Subtracting maximum from each of the split lse's for better numerical stability
+    lse_split_offset = (
+        tl.arange(0, BLOCK_M)[:, None]
+        + tl.arange(0, MAX_N_SPLITS)[None, :] * lse_split_stride
     )
+    lse_split_mask = (pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None] < q_total) & (
+        tl.arange(0, MAX_N_SPLITS)[None, :] < n_splits
+    )
+    lse_splits = tl.load(
+        lse_splits_ptr + lse_split_offset, mask=lse_split_mask, other=float("-inf")
+    )
+    max_lse = tl.max(lse_splits, 1)
+
+    # Sum exp(lse(i) - max_lse) over all split i to obtain Z=sumexp(QK) up to a scaled factor exp(-max_lse)
+    # Fully masked rows have -inf in every split; avoid inf - inf.
+    max_lse = tl.where(max_lse == float("-inf"), 0.0, max_lse)
+    Zi_scaled = tl.exp(lse_splits - max_lse[:, None])
+    Z_scaled = tl.sum(Zi_scaled, 1)
+    Zi_Z = Zi_scaled / tl.where(Z_scaled == 0, 1.0, Z_scaled)[:, None]
+
+    # Write back LSE
+    lse = tl.where(Z_scaled == 0, float("inf"), tl.log(Z_scaled) + max_lse)
+    out_mask = pid * BLOCK_M + tl.arange(0, BLOCK_M) < q_total
+    tl.store(lse_ptr + tl.arange(0, BLOCK_M), lse, mask=out_mask)
+
+    out_split_offset = (
+        tl.arange(0, BLOCK_M)[:, None, None] * head_size
+        + tl.arange(0, MAX_N_SPLITS)[None, :, None] * out_split_stride
+        + tl.arange(0, BLOCK_K)[None, None, :]
+    )
+    out_split_mask = (
+        (pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None, None] < q_total)
+        & (tl.arange(0, MAX_N_SPLITS)[None, :, None] < n_splits)
+        & (tl.arange(0, BLOCK_K)[None, None, :] < head_size)
+    )
+    out_splits = tl.load(
+        out_splits_ptr + out_split_offset, mask=out_split_mask, other=0.0
+    )
+    out = tl.sum(Zi_Z[:, :, None] * out_splits, 1)
+    out = out.to(out_ptr.type.element_ty)
+
+    # Write back output.
+    # The split buffers flatten [batch, head, query], but `out` is a BSHD view
+    # whose batch/head/query strides need not follow that storage order. Decode
+    # each row into batch/head/query and use the real output strides, instead
+    # of advancing the base by a contiguous row pitch.
+    row = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    batch = row // (num_heads * seqlen_q)
+    head = (row // seqlen_q) % num_heads
+    query = row % seqlen_q
+    out_offset = (
+        batch[:, None] * out_b_stride
+        + head[:, None] * out_h_stride
+        + query[:, None] * out_s_stride
+        + tl.arange(0, BLOCK_K)[None, :]
+    )
+    dmask = tl.arange(0, BLOCK_K) < head_size
+    tl.store(out_ptr + out_offset, out, mask=out_mask[:, None] & dmask[None, :])

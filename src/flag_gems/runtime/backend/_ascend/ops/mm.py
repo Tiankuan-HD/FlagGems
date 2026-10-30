@@ -131,11 +131,10 @@ def _mm_heur_divisible_n(args):
     return args["N"] % args["BLOCK_N"] == 0
 
 
-
-
 def _mm_grid(M, N, meta):
     num_tiles = triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"])
     return (min(num_tiles * meta.get("SPLIT_K", 1), _MAX_CORE_DIM),)
+
 
 # Ascend's launch coreDim is uint16. Keep the grid bounded even when the
 # compiler cannot automatically map logical programs onto physical cores.

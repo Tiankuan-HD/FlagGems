@@ -102,7 +102,9 @@ def mul_kernel(
     BLOCK_SIZE: tl.constexpr,
     IS_BOOL: tl.constexpr,
 ):
-    for block_id in range(tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)):
+    for block_id in range(
+        tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)
+    ):
         offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         x = tl.load(x_ptr + offsets, mask=mask)
@@ -238,7 +240,9 @@ def mul_broadcast_2d_kernel(
     BLOCK_SIZE: tl.constexpr,
     IS_BOOL: tl.constexpr,
 ):
-    for block_id in range(tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)):
+    for block_id in range(
+        tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)
+    ):
         offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         row = offsets // n_cols
@@ -321,7 +325,9 @@ def mul_generic_nd_runtime_meta_kernel(
     BLOCK_SIZE: tl.constexpr,
     IS_BOOL: tl.constexpr,
 ):
-    for block_id in range(tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)):
+    for block_id in range(
+        tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)
+    ):
         offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         linear = offsets
@@ -378,7 +384,9 @@ def mul_complex_generic_nd_kernel(
 ):
     # Ascend coreDim is limited to UINT16_MAX. Iterate over tiles when the
     # launch grid is capped, keeping each tile small enough for the UB.
-    for block_id in range(tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)):
+    for block_id in range(
+        tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)
+    ):
         offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         linear = offsets
@@ -434,7 +442,9 @@ def mul_complex_generic_nd_runtime_meta_kernel(
     dtype: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    for block_id in range(tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)):
+    for block_id in range(
+        tl.program_id(0), tl.cdiv(n_elements, BLOCK_SIZE), tl.num_programs(0)
+    ):
         offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         linear = offsets
@@ -759,9 +769,7 @@ def mul_broadcast_tiled_kernel(
 
     # Ascend coreDim is limited to UINT16_MAX. Iterate over tiles when the
     # launch grid is capped, keeping each tile small enough for the UB.
-    for tile_id in range(
-        tl.program_id(0), total_tiles, tl.num_programs(0)
-    ):
+    for tile_id in range(tl.program_id(0), total_tiles, tl.num_programs(0)):
         row_tile = tile_id // col_tiles
         col_tile = tile_id % col_tiles
         rows = row_tile * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -844,7 +852,9 @@ def _launch_2d_broadcast(
             )
         return output
     MAX_CORE_DIM = 65535
-    grid = lambda meta: (min(triton.cdiv(n_elements, meta["BLOCK_SIZE"]), MAX_CORE_DIM),)
+    grid = lambda meta: (
+        min(triton.cdiv(n_elements, meta["BLOCK_SIZE"]), MAX_CORE_DIM),
+    )
     with torch_device_fn.device(output.device):
         mul_broadcast_2d_kernel[grid](
             a_t,

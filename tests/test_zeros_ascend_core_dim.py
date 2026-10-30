@@ -75,9 +75,7 @@ def checked_launches(zeros_ops, monkeypatch):
                 resolved = grid(meta) if callable(grid) else grid
                 # Reject an invalid launch before it can poison the NPU context.
                 assert 0 < math.prod(resolved) <= CORE_DIM_LIMIT
-                launches.append(
-                    (resolved, meta["BLOCK_SIZE"], meta["BLOCK_SIZE_SUB"])
-                )
+                launches.append((resolved, meta["BLOCK_SIZE"], meta["BLOCK_SIZE_SUB"]))
                 return resolved
 
             return kernel[checked_grid]
@@ -307,9 +305,9 @@ def test_zero_launch_core_dim_limit(zeros_ops, monkeypatch, op, logical_blocks):
     assert result is tensor
     assert launches
     for grid in launches:
-        assert 0 < math.prod(grid) <= CORE_DIM_LIMIT, (
-            f"{op}: numel={numel}, grid={grid}, coreDim must be <= {CORE_DIM_LIMIT}"
-        )
+        assert (
+            0 < math.prod(grid) <= CORE_DIM_LIMIT
+        ), f"{op}: numel={numel}, grid={grid}, coreDim must be <= {CORE_DIM_LIMIT}"
 
 
 @pytest.mark.parametrize(
@@ -389,10 +387,14 @@ def test_zeros_factory_capped_grid_exact(
     with monkeypatch.context() as patch:
         patch.setattr(torch, allocator, poisoned_allocate)
         if api == "direct":
-            result = getattr(flag_gems, op)(argument, device=inp.device, dtype=inp.dtype)
+            result = getattr(flag_gems, op)(
+                argument, device=inp.device, dtype=inp.dtype
+            )
         else:
             with flag_gems.use_gems(include=[op]):
-                result = getattr(torch, op)(argument, device=inp.device, dtype=inp.dtype)
+                result = getattr(torch, op)(
+                    argument, device=inp.device, dtype=inp.dtype
+                )
     torch.npu.synchronize()
     _assert_exact(result, torch.zeros(shape, dtype=inp.dtype))
     assert checked_launches

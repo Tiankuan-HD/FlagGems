@@ -21,7 +21,6 @@ import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as extension
 
-from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import broadcastable_to, libentry, libtuner
@@ -43,8 +42,16 @@ def _blockified():
             os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = previous
 
 
-# Preserve the existing candidates for other dtypes, layouts, and small GEMMs.
-_ADDMM_BASE_CONFIGS = runtime.get_tuned_config("mm")
+# Keep addmm's validated fallback independent of the shared mm tuning space.
+# In particular, NT layouts and small GEMMs cannot use every mm candidate.
+_ADDMM_BASE_CONFIGS = [
+    triton.Config(
+        {"BLOCK_M": m, "BLOCK_N": n, "BLOCK_K": k, "SPLIT_K": 1},
+        num_warps=4,
+        num_stages=2,
+    )
+    for m, n, k in ((16, 32, 32), (128, 128, 128), (256, 256, 256))
+]
 _ADDMM_HEURISTICS = {
     **_hcu.HEURISTICS_CONFIGS["mm"],
     "DIVISIBLE_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
@@ -394,6 +401,7 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
         bias_stride_n = bias.stride(1)
     dot_out_dtype = tl.float32
     MAX_CORE_DIM = 65535
+
     def _addmm_grid(META):
         grid_m = triton.cdiv(M, META["BLOCK_M"])
         grid_n = triton.cdiv(N, META["BLOCK_N"])
@@ -402,6 +410,7 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
         # Cap the first dimension, accounting for SPLIT_K
         capped_grid = min(grid_2d, MAX_CORE_DIM // split_k)
         return (capped_grid, split_k)
+
     with torch_device_fn.device(mat1.device), _blockified():
         addmm_kernel[_addmm_grid](
             mat1,

@@ -25,8 +25,6 @@ kernel, which is what these tests pin down: they assert on the grid that is
 actually launched, not only on the numerical result.
 """
 
-import importlib
-
 import pytest
 import torch
 
@@ -92,9 +90,16 @@ def _check(M, N, dtype):
     eps = 1e-5
     torch.manual_seed(0)
     x = torch.randn((M, N), dtype=dtype, device=flag_gems.device).requires_grad_(True)
-    weight = torch.randn((N,), dtype=dtype, device=flag_gems.device).requires_grad_(True)
+    weight = torch.randn((N,), dtype=dtype, device=flag_gems.device).requires_grad_(
+        True
+    )
     dy = torch.randn((M, N), dtype=dtype, device=flag_gems.device)
-    ref_y, ref_dx, ref_dw = _reference(x.detach(), weight.detach(), dy, eps)
+    ref_y, ref_dx, ref_dw = _reference(
+        utils.to_reference(x.detach()),
+        utils.to_reference(weight.detach()),
+        utils.to_reference(dy),
+        eps,
+    )
 
     out = flag_gems.rms_norm(x, [N], weight, eps)
     res_y = out.detach()
@@ -109,7 +114,7 @@ def _check(M, N, dtype):
     # 1e-6 rtol would gate on summation order rather than on correctness.
     assert res_dw.dtype == dtype
     torch.testing.assert_close(
-        res_dw.float(),
+        utils.to_cpu(res_dw, ref_dw).float(),
         ref_dw,
         rtol=1e-2,
         atol=1e-2 * ref_dw.abs().max(),

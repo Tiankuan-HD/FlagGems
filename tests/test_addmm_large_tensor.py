@@ -36,8 +36,11 @@ Test cases cover:
 5. Different alpha/beta values
 """
 
+import importlib
+
 import pytest
 import torch
+import triton
 
 import flag_gems
 
@@ -132,9 +135,9 @@ def test_addmm_large_matrix_alpha_beta(M, N, K, alpha, beta, dtype):
 @pytest.mark.parametrize(
     "N",
     [
-        128,   # Small - uses _addmm_small_* path
-        256,   # Medium
-        512,   # Large
+        128,  # Small - uses _addmm_small_* path
+        256,  # Medium
+        512,  # Large
         1024,  # Very large
     ],
 )
@@ -198,3 +201,50 @@ def test_addmm_out_large_matrix(M, N, K, dtype):
     flag_gems.addmm_out(bias, mat1, mat2, out=out)
 
     utils.gems_assert_close(out, ref_out, dtype, reduce_dim=K)
+
+
+@pytest.mark.addmm
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="Ascend addmm fallback tuning candidates",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("b_column_major", [False, True])
+@pytest.mark.parametrize("vector_bias", [False, True])
+def test_addmm_fallback_autotuning(monkeypatch, dtype, b_column_major, vector_bias):
+    # A cached best config or timing can hide an invalid autotuning candidate.
+    # Exercise fresh tuning, including the NT layout that triggered an aicore
+    # exception with the shared MM tuning space. The normal tuner still handles
+    # candidates that the compiler rejects before launching them.
+    M, N, K = 15, 160, 1024
+    torch.manual_seed(0)
+    a = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
+    b = torch.randn(
+        (N, K) if b_column_major else (K, N), dtype=dtype, device=flag_gems.device
+    )
+    if b_column_major:
+        b = b.t()
+    bias = torch.randn(
+        (N,) if vector_bias else (M, N), dtype=dtype, device=flag_gems.device
+    )
+    expected = torch.addmm(
+        utils.to_reference(bias, True),
+        utils.to_reference(a, True),
+        utils.to_reference(b, True),
+        alpha=0.5,
+        beta=2.0,
+    )
+    op_globals = flag_gems.addmm.__globals__
+    tuner = op_globals["addmm_kernel"]
+    while not isinstance(tuner, triton.runtime.Autotuner):
+        tuner = tuner.fn
+    # Bypass LibEntry's dispatch cache and isolate both tuning caches without
+    # clearing or writing the user's persistent tuning results.
+    libentry_module = importlib.import_module("flag_gems.utils.libentry")
+    monkeypatch.setitem(op_globals, "addmm_kernel", tuner)
+    monkeypatch.setattr(tuner, "cache", {})
+    monkeypatch.setattr(libentry_module.libcache, "get_benchmark", lambda *args: {})
+    actual = flag_gems.addmm(bias, a, b, alpha=0.5, beta=2.0)
+    utils.gems_assert_close(actual, expected, dtype, reduce_dim=K)
+    assert tuner.benchmark_success_count > 0
+    assert tuner.benchmark_cache_hit_count == 0

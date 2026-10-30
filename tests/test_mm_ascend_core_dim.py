@@ -38,9 +38,11 @@ def ascend_mm():
 
 def _run_kernel(ascend_mm, a, b, out, split_k):
     # Exercise the smallest tuning candidate directly: autotuning may select
-    # a larger tile and otherwise hide the overflowing-grid regression.
+    # a larger tile and otherwise hide the overflowing-grid regression. Keep
+    # the heuristics wrapper so all derived constexprs (including divisibility
+    # flags) are supplied exactly as they are for a normal launch.
     kernel = ascend_mm.mm_kernel
-    while not isinstance(kernel, triton.runtime.JITFunction):
+    while not isinstance(kernel, triton.runtime.Heuristics):
         kernel = kernel.fn
     M, K = a.shape
     N = b.shape[1]
@@ -59,7 +61,6 @@ def _run_kernel(ascend_mm, a, b, out, split_k):
         *out.stride(),
         dot_out_dtype=tl.float32,
         GROUP_M=8,
-        EVEN_K=K % (meta["BLOCK_K"] * split_k) == 0,
         **meta,
     )
 
@@ -81,7 +82,7 @@ def test_mm_ascend_core_dim_boundary(ascend_mm, M, N, K, split_k):
     # the atomic add; this test checks launch limits and tile coverage.
     out_dtype = torch.float32 if split_k > 1 else a.dtype
     out = torch.zeros((M, N), dtype=out_dtype, device=flag_gems.device)
-    ref = torch.mm(a.float(), b.float())
+    ref = torch.mm(utils.to_reference(a).float(), utils.to_reference(b).float())
     _run_kernel(ascend_mm, a, b, out, split_k)
     utils.gems_assert_close(out, ref, out.dtype, reduce_dim=K)
 
@@ -98,7 +99,7 @@ def test_mm_ascend_repeated_tiles(ascend_mm, monkeypatch, dtype, split_k, K):
     b = torch.randn((N, K), dtype=dtype, device=flag_gems.device).t()
     out_dtype = torch.float32 if split_k > 1 else dtype
     out = torch.zeros((M, N), dtype=out_dtype, device=flag_gems.device)
-    ref = torch.mm(a.float(), b.float())
+    ref = torch.mm(utils.to_reference(a).float(), utils.to_reference(b).float())
     _run_kernel(ascend_mm, a, b, out, split_k)
     utils.gems_assert_close(out, ref, out.dtype, reduce_dim=max(K, 1))
 
@@ -109,7 +110,7 @@ def test_mm_ascend_large_grid_entrypoints(ascend_mm, use_out):
     M, N, K = 4352, 10240, 33
     a = torch.randn((M, K), dtype=torch.bfloat16, device=flag_gems.device)
     b = torch.randn((N, K), dtype=torch.bfloat16, device=flag_gems.device).t()
-    ref = torch.mm(a.float(), b.float())
+    ref = torch.mm(utils.to_reference(a).float(), utils.to_reference(b).float())
     if use_out:
         out = torch.empty((M, N), dtype=a.dtype, device=a.device)
         assert ascend_mm.mm_out(a, b, out=out) is out

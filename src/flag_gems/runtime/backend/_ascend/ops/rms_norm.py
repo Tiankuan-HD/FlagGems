@@ -237,7 +237,6 @@ def rms_norm_grad_split_n_smalld(
     dw_acc = tl.full((BLOCK_N,), 0, tl.float32)
     row_begin = pid * ROWS_PER_PROGRAM
 
-    # 逐 Tile 遍历当前 Program 负责的行，末尾行使用 mask 防止越界。
     for offset in range(0, ROWS_PER_PROGRAM, BLOCK_M):
         rows = row_begin + offset + tile_rows
         valid_rows = (rows < M) & (rows < row_begin + ROWS_PER_PROGRAM)
@@ -249,7 +248,6 @@ def rms_norm_grad_split_n_smalld(
         z = x * rstd[:, None]
         g = dy * gamma[None, :]
 
-        # 与 CANN ComputeSmallD 一致：dw 沿行归约，dx 的均值逐行沿列归约。
         dw_acc += tl.sum(dy * z, axis=0)
         mean = tl.sum(g * z, axis=1) / N
         dx = rstd[:, None] * (g - z * mean[:, None])

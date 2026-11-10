@@ -15,11 +15,15 @@
 import contextlib
 import logging
 import os
+import statistics
+import threading
+from collections import OrderedDict
 
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
+from triton.compiler.errors import CompilationError
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
@@ -811,8 +815,386 @@ def get_higher_dtype(a, b):
             return a
 
 
+@triton.jit
+def _mm_tn_split_kernel(
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    AM: tl.constexpr,
+    AK: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GROUP: tl.constexpr,
+    SPLIT: tl.constexpr,
+):
+    task = tl.program_id(0)
+    pid = task // SPLIT
+    part = task % SPLIT
+    gm = tl.cdiv(M, BM)
+    gn = tl.cdiv(N, BN)
+    width = GROUP * gn
+    group_id = pid // width
+    group_size = tl.minimum(gm - group_id * GROUP, GROUP)
+    rm = (group_id * GROUP + pid % group_size) * BM + tl.arange(0, BM)
+    rn = ((pid % width) // group_size) * BN + tl.arange(0, BN)
+    rk = part * (K // SPLIT) + tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for step in range(K // (SPLIT * BK)):
+        kk = rk + step * BK
+        a = tl.load(
+            A + rm[:, None] * AM + kk[None, :] * AK, (rm < M)[:, None], other=0.0
+        )
+        b = tl.load(B + kk[:, None] * N + rn[None, :], (rn < N)[None, :], other=0.0)
+        acc += tl.dot(a, b, allow_tf32=False)
+    tl.store(
+        C + part * M * N + rm[:, None] * N + rn[None, :],
+        acc,
+        (rm < M)[:, None] & (rn < N)[None, :],
+    )
+
+
+@triton.jit
+def _mm_tn_reduce_partials(
+    P, C, SIZE: tl.constexpr, SPLIT: tl.constexpr, BLOCK: tl.constexpr
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    total = tl.full((BLOCK,), 0, tl.float32)
+    for part in tl.static_range(SPLIT):
+        total += tl.load(P + part * SIZE + index, index < SIZE, other=0.0)
+    tl.store(C + index, total, index < SIZE)
+
+
+@triton.jit
+def _mm_strided_direct_kernel(
+    A,
+    B,
+    C,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    AM: tl.constexpr,
+    AK: tl.constexpr,
+    BK_STRIDE: tl.constexpr,
+    BN_STRIDE: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    grid_m = tl.cdiv(M, BM)
+    grid_n = tl.cdiv(N, BN)
+    width = GROUP * grid_n
+    group_id = pid // width
+    local = pid % width
+    group_size = tl.minimum(grid_m - group_id * GROUP, GROUP)
+    mi = group_id * GROUP + local % group_size
+    ni = local // group_size
+    rm = mi * BM + tl.arange(0, BM)
+    rn = ni * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.full((BM, BN), 0, tl.float32)
+
+    for step in range(K // BK):
+        k = step * BK + rk
+        a = tl.load(A + rm[:, None] * AM + k[None, :] * AK, (rm < M)[:, None], other=0)
+        b = tl.load(
+            B + k[:, None] * BK_STRIDE + rn[None, :] * BN_STRIDE,
+            (rn < N)[None, :],
+            other=0,
+        )
+        acc += tl.dot(a, b, allow_tf32=False)
+    if K % BK:
+        k = (K // BK) * BK + rk
+        a = tl.load(
+            A + rm[:, None] * AM + k[None, :] * AK,
+            (rm < M)[:, None] & (k < K)[None, :],
+            other=0,
+        )
+        b = tl.load(
+            B + k[:, None] * BK_STRIDE + rn[None, :] * BN_STRIDE,
+            (k < K)[:, None] & (rn < N)[None, :],
+            other=0,
+        )
+        acc += tl.dot(a, b, allow_tf32=False)
+    tl.store(
+        C + rm[:, None] * N + rn[None, :], acc, (rm < M)[:, None] & (rn < N)[None, :]
+    )
+
+
+# Tune supported dense BF16 layouts against the existing mm path.
+# The existing implementation remains a candidate for every eligible input.
+_MM_TN_TILES = ((128, 128), (128, 256), (256, 128))
+_MM_TN_MAX_WORKSPACE = 16 * 1024 * 1024
+_MM_TN_PLANS = OrderedDict()
+_MM_TN_LOCK = threading.Lock()
+
+
+def _mm_tn_candidates(m, n, k, cores):
+    candidates = []
+    for split in (1, 2, 4):
+        if k < split * _HUGE_K or (
+            split > 1 and split * m * n * 4 > _MM_TN_MAX_WORKSPACE
+        ):
+            continue
+        ranked = []
+        for block_k in (128, 256):
+            if k % (split * block_k):
+                continue
+            for block_m, block_n in _MM_TN_TILES:
+                grid_m, grid_n = triton.cdiv(m, block_m), triton.cdiv(n, block_n)
+                tiles = grid_m * grid_n
+                tasks = tiles * split
+                if tasks > _MAX_CORE_DIM or (split > 1 and tiles >= cores):
+                    continue
+                # Estimate padded work over whole waves of cores. The estimate
+                # ranks legal tiles only; it cannot predict data movement.
+                wave_work = triton.cdiv(tasks, cores) * block_m * block_n // split
+                config = (block_m, block_n, block_k, min(grid_m, 8), split)
+                ranked.append((wave_work, -block_k, config))
+        ranked.sort()
+        if ranked:
+            candidates.append(ranked[0][-1])
+        if split == 1 and ranked:
+            first = ranked[0][-1]
+            # Keep the best K tile for each output tile orientation. Wave
+            # count alone misses the different reuse of A and B.
+            seen = {first[:2]}
+            for _, _, config in ranked[1:]:
+                tile = config[:2]
+                if tile not in seen:
+                    candidates.append(config)
+                    seen.add(tile)
+            # Keep one alternate K tile for the highest-ranked orientation.
+            for _, _, config in ranked[1:]:
+                if config[:2] == first[:2] and config[2] != first[2]:
+                    candidates.append(config)
+                    break
+    # Also consider a wider M traversal for long reductions. This changes
+    # the reuse order, rather than the output tile's shape.
+    for config in tuple(candidates):
+        if config[4] != 1:
+            continue
+        group = min(triton.cdiv(m, config[0]), 16)
+        if group > config[3]:
+            candidates.append((*config[:3], group, config[4]))
+    return candidates
+
+
+def _launch_mm_tn(a, b, out, config):
+    m, k = a.shape
+    n = b.shape[1]
+    block_m, block_n, block_k, group, split = config
+    if out is None:
+        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    partials = (
+        torch.empty((split, m, n), dtype=torch.float32, device=a.device)
+        if split > 1
+        else out
+    )
+    grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n) * split,)
+    if a.is_contiguous():
+        with _compiling(a.device):
+            _mm_strided_direct_kernel[grid](
+                a,
+                b,
+                out,
+                m,
+                n,
+                k,
+                *a.stride(),
+                *b.stride(),
+                block_m,
+                block_n,
+                block_k,
+                group,
+                multibuffer=True,
+                unit_flag=True,
+                sync_solver=False,
+            )
+        return out
+    with _compiling(a.device):
+        _mm_tn_split_kernel[grid](
+            a,
+            b,
+            partials,
+            m,
+            n,
+            k,
+            *a.stride(),
+            block_m,
+            block_n,
+            block_k,
+            group,
+            split,
+            multibuffer=True,
+            unit_flag=True,
+            sync_solver=False,
+        )
+        if split > 1:
+            _mm_tn_reduce_partials[(triton.cdiv(m * n, 4096),)](
+                partials, out, m * n, split, 4096
+            )
+    return out
+
+
+def _run_mm_tn_plan(a, b, out, config):
+    if config is not None:
+        return _launch_mm_tn(a, b, out, config)
+    if out is None:
+        return _mm_default(a, b)
+    return _mm_out_default(a, b, out=out)
+
+
+def _choose_mm_tn_plan(a, b, out, candidates):
+    # Warm up each complete path before timing. Interleave samples to limit
+    # frequency drift. Count layout conversion and FP32 reduction kernels.
+    plans = [None]
+    _run_mm_tn_plan(a, b, out, None)
+    for config in candidates:
+        try:
+            _launch_mm_tn(a, b, out, config)
+        except (CompilationError, torch.OutOfMemoryError):
+            logger.debug("Skipping unavailable Ascend mm config %s", config)
+            continue
+        plans.append(config)
+    if len(plans) == 1:
+        return None
+
+    timings = {config: [] for config in plans}
+    for _ in range(3):
+        for config in plans:
+            start = torch_device_fn.Event(enable_timing=True)
+            end = torch_device_fn.Event(enable_timing=True)
+            start.record()
+            _run_mm_tn_plan(a, b, out, config)
+            end.record()
+            end.synchronize()
+            timings[config].append(start.elapsed_time(end))
+    medians = {
+        config: statistics.median(samples) for config, samples in timings.items()
+    }
+    fastest = min(plans, key=medians.__getitem__)
+    # Keep the existing path when the gain is within measurement noise.
+    return fastest if medians[fastest] < 0.95 * medians[None] else None
+
+
+def _try_mm_tn(a, b, out=None):
+    if (
+        a.ndim != 2
+        or b.ndim != 2
+        or a.dtype != torch.bfloat16
+        or b.dtype != a.dtype
+        or a.device != b.device
+    ):
+        return None
+    m, k = a.shape
+    n = b.shape[1]
+    is_nt = a.is_contiguous() and b.stride() == (1, k)
+    is_nn = a.is_contiguous() and b.is_contiguous()
+    is_tn = a.stride() == (1, m) and b.is_contiguous()
+    # The NN candidate targets a partial K tile and large M task grids.
+    # Aligned K stays on the existing implementation.
+    if (
+        not (is_nt or is_nn or is_tn)
+        or (is_tn and k < _HUGE_K)
+        or (is_nt and n * k * a.element_size() < 16 * 1024 * 1024)
+        or k < 128
+        or (not is_nn and k % 128)
+        or (is_nn and (k < 1024 or k % 256 == 0))
+        or k != b.shape[0]
+        or not m
+        or not n
+        or m % 16
+        or n % 16
+        or a.data_ptr() % 32
+        or b.data_ptr() % 32
+        or max(m * k, n * k, m * n) >= 2**31
+    ):
+        return None
+    if out is not None and (
+        out.device != a.device
+        or out.dtype != a.dtype
+        or out.shape != (m, n)
+        or not out.is_contiguous()
+        or out.data_ptr() % 32
+        or out.untyped_storage().data_ptr()
+        in (a.untyped_storage().data_ptr(), b.untyped_storage().data_ptr())
+    ):
+        return None
+
+    # The guards fix dtype, strides and alignment for a given shape. The
+    # allocated-output and caller-owned-output paths have different baselines.
+    key = (a.device.index, m, n, k, out is not None)
+    if is_nt:
+        key += ("nt",)
+    elif is_nn:
+        key += ("nn",)
+    with _MM_TN_LOCK:
+        if key in _MM_TN_PLANS:
+            _MM_TN_PLANS.move_to_end(key)
+            config = _MM_TN_PLANS[key]
+        else:
+            config = None
+            with torch_device_fn.device(a.device):
+                capturing = getattr(
+                    torch_device_fn, "is_current_stream_capturing", None
+                )
+                if capturing is None or capturing():
+                    return None
+                try:
+                    cores = torch_device_fn.get_device_limit(a.device.index)[
+                        "cube_core_num"
+                    ]
+                except (AttributeError, KeyError, RuntimeError, TypeError):
+                    return None
+                if not isinstance(cores, int) or cores < 1:
+                    return None
+                if is_nt:
+                    bk = 256 if k % 256 == 0 else 128
+                    candidates = [
+                        (bm, bn, bk, min(triton.cdiv(m, bm), 8), 1)
+                        for bm, bn in _MM_TN_TILES
+                        if triton.cdiv(m, bm) * triton.cdiv(n, bn) <= _MAX_CORE_DIM
+                    ]
+                elif is_nn:
+                    grid_m = triton.cdiv(m, 128)
+                    grid_n = triton.cdiv(n, 256)
+                    # Small task grids have little room to amortize tuning
+                    # noise and scheduling, so keep the original path.
+                    if grid_m < 8 * cores or grid_n < 2:
+                        candidates = []
+                    else:
+                        candidates = [
+                            (128, 256, 256, group, 1)
+                            for group in (1, 2, 4, 8, 16)
+                            if grid_m * grid_n <= _MAX_CORE_DIM
+                        ]
+                else:
+                    candidates = _mm_tn_candidates(m, n, k, cores)
+                if candidates:
+                    config = _choose_mm_tn_plan(a, b, out, candidates)
+            _MM_TN_PLANS[key] = config
+            if len(_MM_TN_PLANS) > _MM_LAUNCH_LIMIT:
+                _MM_TN_PLANS.popitem(last=False)
+            logger.debug("Ascend mm plan %s: %s", key, config)
+
+    if config is None:
+        return None
+    return _launch_mm_tn(a, b, out, config)
+
+
 def mm(a, b):
     logger.debug("GEMS_ASCEND MM")
+    result = _try_mm_tn(a, b)
+    return _mm_default(a, b) if result is None else result
+
+
+def _mm_default(a, b):
     device = a.device
     # Both `.contiguous()` and `_mm_materialize_broadcast` preserve dtype, so
     # this holds for the whole function. The shape guards below run on every
@@ -1182,6 +1564,11 @@ def mm(a, b):
 
 def mm_out(a, b, *, out):
     logger.debug("GEMS_ASCEND MM_OUT")
+    result = _try_mm_tn(a, b, out)
+    return _mm_out_default(a, b, out=out) if result is None else result
+
+
+def _mm_out_default(a, b, *, out):
     if not a.is_contiguous():
         a = a.contiguous()
     if not b.is_contiguous():

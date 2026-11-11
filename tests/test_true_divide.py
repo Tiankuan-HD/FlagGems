@@ -148,3 +148,30 @@ def test_true_divide_tensor_inplace_dispatch(shape, dtype, caplog):
     )
     assert res_out is inp1
     utils.gems_assert_close(inp1, ref_inp1, dtype, equal_nan=True)
+
+
+@pytest.mark.true_divide
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend UB regression")
+@pytest.mark.parametrize("numel", [16384, 1048593])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+@pytest.mark.parametrize(
+    "operands", ["tensor_tensor", "tensor_scalar", "scalar_tensor"]
+)
+def test_true_divide_ascend_ub(numel, dtype, operands):
+    # Exercise the old overflowing tile and multiple persistent iterations with
+    # a masked tail. Integer inputs also need UB space for conversion to FP32.
+    a = torch.randint(-100, 100, (numel,), dtype=torch.int64).to(dtype)
+    b = torch.randint(1, 100, (numel,), dtype=torch.int64).to(dtype)
+    if operands == "tensor_scalar":
+        b = 2.5
+    elif operands == "scalar_tensor":
+        a = 2.5
+    expected = torch.true_divide(a, b)
+    a_device = a.to(flag_gems.device) if isinstance(a, torch.Tensor) else a
+    b_device = b.to(flag_gems.device) if isinstance(b, torch.Tensor) else b
+
+    result = flag_gems.true_divide(a_device, b_device)
+
+    torch.testing.assert_close(result.cpu(), expected, equal_nan=True)

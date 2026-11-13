@@ -178,6 +178,7 @@ from .linalg_solve_triangular import (
 )
 from .linalg_tensorinv import linalg_tensorinv
 from .linear import linear
+from .linear_backward import linear_backward
 from .linspace import linspace
 from .log1p import log1p
 from .log2 import log2

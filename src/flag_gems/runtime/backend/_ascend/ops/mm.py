@@ -42,7 +42,111 @@ def _blockified():
             os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = previous
 
 
-def _prune_mm_configs(configs, named_args, **kwargs):
+@contextlib.contextmanager
+def _compiling(device):
+    """Scope a launch that may compile: bind the device, ask for blockified
+    code. A cached launch does neither, so it skips this."""
+    with torch_device_fn.device(device), _blockified():
+        yield
+
+
+# A `mm_kernel` launch costs 110-130 us of host time here against 10-14 us for
+# the same GEMM through aten, while the kernels are within 1.2x. Taking one
+# launch apart shows the hardware launch is 29 us of that; the rest is Python
+# that `LibEntry.run` rebuilds every call -- it reclassifies each argument,
+# rebuilds the dispatch key, and re-evaluates the grid.
+#
+# For this kernel all three results are a pure function of the key below:
+# the grid reads only M, N and the selected tile, and M, N and every stride are
+# explicit specialized arguments. So the assembled launch is stored once per
+# key and a hit goes straight to the compiled kernel. `_nvidia/hopper/ops/
+# mm_w8a8_fp8.py` keeps a launch cache the same way.
+#
+# A miss still goes through `LibEntry.run` unchanged, so compilation,
+# autotuning and heuristics behave exactly as before; only a hit takes the
+# short path, and it neither compiles nor rebinds the device. A stored entry is
+# not revalidated against the tuner -- the same lifetime `LibEntry` already
+# gives the compiled kernels in its own cache.
+_MM_LAUNCH_CACHE = {}
+_MM_LAUNCH_LIMIT = 1024
+# Bound to module level so one `site` implies one fixed set of keyword
+# arguments and the key does not have to carry them.
+# GROUP_M is deliberately absent from both: triton rejects a keyword argument
+# that is also an auto-tuned config key, and on weight-gradient shapes the
+# tuner's choice is worth ~30% (see `_prune_mm_configs`).
+_MM_KWARGS = {
+    "dot_out_dtype": tl.float32,
+    "multibuffer": True,
+    "unit_flag": True,
+    "sync_solver": False,
+}
+_MM_OUT_KWARGS = {"dot_out_dtype": tl.float32}
+
+
+def _launch_mm_kernel(args, kwargs, site, grid):
+    """Launch `mm_kernel`, reusing a cached assembly when the key matches.
+
+    `args[:3]` are the operands, substituted on every call; everything after
+    them -- sizes and strides -- enters the key by value. `site` separates call
+    sites, each of which passes one fixed `kwargs`.
+    """
+    a, b, c = args[0], args[1], args[2]
+    key = (
+        site,
+        a.dtype,
+        b.dtype,
+        c.dtype,
+        a.device.index,
+        a.data_ptr() % 16,
+        b.data_ptr() % 16,
+        c.data_ptr() % 16,
+    ) + tuple(args[3:])
+
+    plan = _MM_LAUNCH_CACHE.get(key)
+    if plan is None:
+        with _compiling(a.device):
+            kernel, constexprs = mm_kernel[grid](*args, **kwargs)
+        # Reassemble what that launch passed down, by the rule `LibEntry.run`
+        # uses: a keyword argument wins over the tuner's and the heuristics'
+        # values, which `constexprs` already carries merged together.
+        meta = {**constexprs, **kwargs}
+        names = tuple(mm_kernel.signature.parameters)[len(args) :]
+        try:
+            tail = tuple(args[3:]) + tuple(meta[name] for name in names)
+        except KeyError:  # a parameter this helper cannot reconstruct
+            return
+        launch_grid = (tuple(grid(meta)) + (1, 1))[:3]
+        if len(_MM_LAUNCH_CACHE) >= _MM_LAUNCH_LIMIT:
+            # Least recently used, which a dict's insertion order gives once
+            # every hit re-inserts its key below.
+            coldest = next(iter(_MM_LAUNCH_CACHE), None)
+            if coldest is not None:
+                _MM_LAUNCH_CACHE.pop(coldest, None)
+        _MM_LAUNCH_CACHE[key] = (kernel, launch_grid, tail)
+        return
+
+    # Re-insert on a hit so the order stays least-recently-used. Evicting by
+    # insertion order instead loses the entries that matter: a training step
+    # reuses a handful of large GEMMs recorded in the first iteration, while
+    # packed variable-length sequences keep adding one-off shapes. Those fill
+    # the cache, the large GEMMs are evicted as the oldest, and every launch
+    # misses from then on. Measured end to end: the step holds at 41.4 s for
+    # four iterations, then rises to 43.0-44.6 s -- the unaccelerated figure --
+    # and stays there, while the same model with this op on the vendor backend
+    # is flat across all eight. A dict move is a few hundred nanoseconds
+    # against the 54 us launch this is saving.
+    del _MM_LAUNCH_CACHE[key]
+    _MM_LAUNCH_CACHE[key] = plan
+
+    kernel, launch_grid, tail = plan
+    if a.device.index == torch_device_fn.current_device():
+        kernel[launch_grid](a, b, c, *tail)
+    else:
+        with torch_device_fn.device(a.device):
+            kernel[launch_grid](a, b, c, *tail)
+
+
+def _prune_mm_tiles(configs, named_args, **kwargs):
     if not configs:
         return configs
     args = {**named_args, **kwargs}
@@ -61,7 +165,24 @@ def _prune_mm_configs(configs, named_args, **kwargs):
         if preferred:
             return preferred
     large_aligned = min(m, n) >= 1024 and m % 128 == 0 and n % 128 == 0
-    if not large_aligned:
+    # Size alone decides whether the wide tiles may compete; their M and N tails
+    # are masked off by DIVISIBLE_M / DIVISIBLE_N. Requiring both sizes to be a
+    # multiple of 128 excluded them from every training shape, and they are the
+    # only configs that reach aclnn there. Device time per call, profiler, bf16,
+    # each config forced in turn out of this file's own candidate list:
+    #
+    #   M x N x K          aclnn   128x128x256   best wide tile
+    #   2240x1152x1076     45.5         62.0    42.7  (128x256x256)
+    #   2240x1076x1152     71.3         79.5    59.4  (256x128x256)
+    #   2240x5120x1152    101.0        142.8    94.2  (128x256x256)
+    #   2240x1152x4608     92.6        107.6    92.4  (128x256x256)
+    #
+    # The relative error was identical across all eight configs, so the masked
+    # tails are handled. M is a token count, so `m % 128` was rarely satisfied
+    # -- 2240 % 128 == 64 while 1920 % 128 == 0 -- which is why the gap came and
+    # went from step to step; N was unaligned on the 1076-wide layers.
+    wide_allowed = min(m, n) >= 1024
+    if not wide_allowed:
         configs = [
             config
             for config in configs
@@ -96,6 +217,18 @@ def _prune_mm_configs(configs, named_args, **kwargs):
                     return preferred
                 preferred_block_k = (256,)
             elif args["A"].dtype in (torch.float16, torch.bfloat16):
+                # A weight-gradient GEMM has the whole token count as its
+                # reduction dimension, which makes it bound by the A/B tile
+                # reads rather than by the Cube; BLOCK_K 256 is then not
+                # automatically better. Device time per call against aclnn:
+                #
+                #   8704x5120x32768   aclnn 10.0 ms
+                #                     256x128x256 29.7 ms   256x128x128 24.6 ms
+                #
+                # so keep both BLOCK_K values in play once K is that large.
+                wide = ((128, 256, 256), (256, 128, 256))
+                if k >= _HUGE_K:
+                    wide += ((128, 256, 128), (256, 128, 128))
                 preferred = [
                     config
                     for config in candidates
@@ -104,7 +237,7 @@ def _prune_mm_configs(configs, named_args, **kwargs):
                         config.kwargs["BLOCK_N"],
                         config.kwargs["BLOCK_K"],
                     )
-                    in ((128, 256, 256), (256, 128, 256))
+                    in wide
                 ]
                 if preferred:
                     return preferred
@@ -121,6 +254,75 @@ def _prune_mm_configs(configs, named_args, **kwargs):
         if preferred:
             return preferred
     return candidates
+
+
+# Above this reduction size the GEMM is the weight-gradient one and the tile
+# traversal order starts to matter; below it, measured on the shapes this
+# backend sees, GROUP_M is worth 0~10% and is not worth extra autotuning.
+_HUGE_K = 8192
+# `mm()` used to hardcode GROUP_M=1, which was never the best choice on a
+# weight-gradient shape. Device time per call against aclnn, best tile fixed:
+#
+#   M x N x K            aclnn   GROUP_M=1   best GROUP_M
+#   8704x5120x32768    10.0 ms     25.2 ms    2  -> 24.2 ms (2.41x)
+#   5120x4352x32768     6.2 ms     11.4 ms   16  ->  8.2 ms (1.32x)
+#   4120x5120x32768     4.6 ms     12.0 ms   16  ->  7.8 ms (1.70x)
+#
+# The optimum moves with the shape, so let the tuner measure it -- but only
+# where the spread is big enough to survive the measurement.
+#
+# 🔴 Offering a choice everywhere made the step 3 s *slower*. The tuner picks
+# from one noisy benchmark, not from the truth: a repeat of the same candidate
+# list has been seen to move 29%, while below this K the whole GROUP_M spread
+# is 0~10%. Given (1, 8) on the ordinary shapes it moved 66 of 174 of them off
+# the 1 they had been using, and that cost more than the weight-gradient
+# shapes gained. So outside the huge-K regime GROUP_M stays at 1 -- what `mm`
+# always passed -- and nothing is measured.
+#
+# `mm_out` used to pass 8 and now gets 1 on those shapes. Its spread there was
+# measured at 0~10% with no consistent direction, and it is the aten `mm.out`
+# entry rather than the GEMM path this is about.
+
+# An N that is not a multiple of the chosen BLOCK_N leaves DIVISIBLE_N false,
+# which masks every B load inside the K loop and forfeits the alignment hints.
+# Padding B's row pitch and the output lets the unmasked path run instead.
+# `_launch_addmm` pads for the same reason. Measured on 8192x4120x5120, summing
+# every kernel one call issues: 2090 us unpadded against 1562 us padded, of
+# which padding B and copying the result back are 109 us, so 528 us net. 128 is
+# the smallest BLOCK_N any candidate uses, so aligning to it satisfies them all.
+_PAD_N_TO = 128
+
+_GROUP_M_CANDIDATES = (1, 2, 8, 16)
+_GROUP_M_DEFAULTS = (1,)
+
+
+def _with_group_m(configs, groups):
+    """Return `configs` once per GROUP_M value, carrying the rest unchanged."""
+    out = []
+    for config in configs:
+        for group_m in groups:
+            out.append(
+                triton.Config(
+                    {**config.kwargs, "GROUP_M": group_m},
+                    num_warps=config.num_warps,
+                    num_stages=config.num_stages,
+                    num_ctas=getattr(config, "num_ctas", 1),
+                )
+            )
+    return out
+
+
+def _prune_mm_configs(configs, named_args, **kwargs):
+    """Pick the tiles, then attach the GROUP_M values worth measuring.
+
+    Neither `mm()` nor `mm_out()` passes GROUP_M any more -- triton rejects a
+    keyword argument that is also a config key -- so every config returned here
+    must carry one.
+    """
+    args = {**named_args, **kwargs}
+    tiles = _prune_mm_tiles(configs, named_args, **kwargs)
+    groups = _GROUP_M_CANDIDATES if args["K"] >= _HUGE_K else _GROUP_M_DEFAULTS
+    return _with_group_m(tiles, groups)
 
 
 def _mm_heur_divisible_m(args):
@@ -160,7 +362,7 @@ def mm_kernel(
     A,
     B,
     C,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     stride_am: tl.constexpr,
@@ -612,8 +814,12 @@ def get_higher_dtype(a, b):
 def mm(a, b):
     logger.debug("GEMS_ASCEND MM")
     device = a.device
+    # Both `.contiguous()` and `_mm_materialize_broadcast` preserve dtype, so
+    # this holds for the whole function. The shape guards below run on every
+    # launch, and this path's cost is dominated by host-side dispatch.
+    both_bf16 = a.dtype == b.dtype == torch.bfloat16
     # Materialize broadcast operands to avoid a zero-stride Cube lowering failure.
-    if a.dtype == b.dtype == torch.bfloat16:
+    if both_bf16:
         if 0 in a.stride():
             a = _mm_materialize_broadcast(a)
         if 0 in b.stride():
@@ -629,14 +835,7 @@ def mm(a, b):
     M, K = a.shape
     _, N = b.shape
     # Pack the narrow right operand once so Cube reads contiguous K rows.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and N == 16
-        and 2048 <= K <= 4096
-        and K % 1024 == 0
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if both_bf16 and N == 16 and 2048 <= K <= 4096 and K % 1024 == 0:
         block_m = 64 if M >= 4096 else 16
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         packed_b = torch.empty((N, K), device=device, dtype=b.dtype)
@@ -665,14 +864,7 @@ def mm(a, b):
             )
         return c
     # Deinterleave four BF16 columns into contiguous K vectors for Cube.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and N == 4
-        and 8192 < K <= 16384
-        and K % 512 == 0
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if both_bf16 and N == 4 and 8192 < K <= 16384 and K % 512 == 0:
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         packed_b = torch.empty((4, K), device=device, dtype=b.dtype)
         with torch_device_fn.device(device), _blockified():
@@ -700,14 +892,12 @@ def mm(a, b):
     # For the very wide BF16 layout, pack B into contiguous N panels so that
     # Cube reads short contiguous rows instead of the original K-strided rows.
     if (
-        a.dtype == b.dtype == torch.bfloat16
+        both_bf16
         and N >= 131072
         and N % 256 == 0
         and 1024 < K <= 2048
         and K % 128 == 0
         and 0 < M <= 128
-        and a.is_contiguous()
-        and b.is_contiguous()
     ):
         block_m = 16 if M <= 16 else 128
         block_n = 256
@@ -735,7 +925,7 @@ def mm(a, b):
     # Panel families: tall/narrow outputs and wide outputs with a large
     # reduction. K alignment is required by the unmasked panel kernels.
     if (
-        a.dtype == b.dtype == torch.bfloat16
+        both_bf16
         and K % 256 == 0
         and (
             (15360 < M <= 16384 and 2048 < N <= 2304 and 4096 < K <= 8192)
@@ -747,8 +937,6 @@ def mm(a, b):
                 and 2048 < K <= 8192
             )
         )
-        and a.is_contiguous()
-        and b.is_contiguous()
     ):
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         packed_b = torch.empty(
@@ -782,12 +970,7 @@ def mm(a, b):
     # Compatibility exceptions: nearby shapes use the generic path in the
     # established workload. Keep their dispatch until wider ranges are measured.
     # Four M tiles per program keep this 64-tile workload balanced over 16 cores.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and (M, N, K) == (480, 4096, 128)
-        and a.is_contiguous()
-        and b.is_contiguous()
-    ):
+    if both_bf16 and (M, N, K) == (480, 4096, 128):
         c = torch.empty((M, N), device=device, dtype=a.dtype)
         with torch_device_fn.device(device), _blockified():
             _mm_persistent_smallk_kernel[(16,)](
@@ -806,18 +989,13 @@ def mm(a, b):
             )
         return c
     # Wider N tiles reduce program count and K-loop overhead on these layouts.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and (
-            (6144 < N <= 7168 and K == 256 and M > 128)
-            or (M, N, K)
-            in (
-                (200, 7168, 2304),
-                (13422, 256, 2048),
-                (480, 4608, 7168),
-            )
+    if both_bf16 and (
+        (6144 < N <= 7168 and K == 256 and M > 128)
+        or (M, N, K)
+        in (
+            (200, 7168, 2304),
+            (13422, 256, 2048),
+            (480, 4608, 7168),
         )
     ):
         c = torch.empty((M, N), device=device, dtype=a.dtype)
@@ -838,20 +1016,14 @@ def mm(a, b):
             )
         return c
     # Explicit tiles for narrow outputs and the remaining slow rectangular layouts.
-    if (
-        a.dtype == b.dtype == torch.bfloat16
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and (M, N, K)
-        in (
-            (1, 64, 4096),
-            (6, 64, 4096),
-            (16, 64, 2048),
-            (4434, 2048, 1024),
-            (1352, 3072, 2048),
-            (80, 12288, 2048),
-            (368, 3072, 2048),
-        )
+    if both_bf16 and (M, N, K) in (
+        (1, 64, 4096),
+        (6, 64, 4096),
+        (16, 64, 2048),
+        (4434, 2048, 1024),
+        (1352, 3072, 2048),
+        (80, 12288, 2048),
+        (368, 3072, 2048),
     ):
         bm = 16 if M <= 16 else 128
         bn = 64 if N == 64 else 256
@@ -926,13 +1098,7 @@ def mm(a, b):
             )
         return c
 
-    if (
-        a.dtype == b.dtype
-        and a.dtype in (torch.float16, torch.bfloat16)
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and K >= 128
-    ):
+    if a.dtype == b.dtype and a.dtype in (torch.float16, torch.bfloat16) and K >= 128:
         if N == 1:
             with torch_device_fn.device(device):
                 _mm_narrow_n_kernel[(triton.cdiv(M, 4),)](
@@ -969,27 +1135,47 @@ def mm(a, b):
             return c
 
     # launch kernel
-    grid = lambda META: _mm_grid(M, N, META)
-    with torch_device_fn.device(a.device), _blockified():
-        mm_kernel[grid](
+    assert dot_out_dtype is _MM_KWARGS["dot_out_dtype"]
+    # Pad N only where the masked path costs more than the two copies: the
+    # reduction has to be long enough for the K loop's masking to dominate, and
+    # the output wide enough that one extra row of tiles is a small share.
+    pad_n = 0
+    if N % _PAD_N_TO != 0 and M >= 4096 and N >= 1024 and K >= 1024:
+        pad_n = triton.cdiv(N, _PAD_N_TO) * _PAD_N_TO
+    if pad_n:
+        b_work = torch.empty((K, pad_n), device=device, dtype=b.dtype)
+        b_work[:, :N].copy_(b)
+        # The kernel reads the padding unmasked and writes it to columns the
+        # caller never sees, but leaving it uninitialized would let a stray NaN
+        # through tl.dot; zeroing the strip is cheap and keeps it deterministic.
+        b_work[:, N:].zero_()
+        c_work = torch.empty((M, pad_n), device=device, dtype=c_dtype)
+    else:
+        b_work, c_work = b, c
+    launch_n = pad_n or N
+    _launch_mm_kernel(
+        (
             a,
-            b,
-            c,
+            b_work,
+            c_work,
             M,
-            N,
+            launch_n,
             K,
             a.stride(0),
             a.stride(1),
-            b.stride(0),
-            b.stride(1),
-            c.stride(0),
-            c.stride(1),
-            dot_out_dtype=dot_out_dtype,
-            GROUP_M=1,
-            multibuffer=True,
-            unit_flag=True,
-            sync_solver=False,
-        )
+            b_work.stride(0),
+            b_work.stride(1),
+            c_work.stride(0),
+            c_work.stride(1),
+        ),
+        _MM_KWARGS,
+        "mm",
+        lambda META: _mm_grid(M, launch_n, META),
+    )
+    if pad_n:
+        # Hand back a contiguous (M, N): a view into the padded buffer would be
+        # non-contiguous, and callers of `mm` do not expect that.
+        c.copy_(c_work[:, :N])
     return c
 
 
@@ -1002,10 +1188,8 @@ def mm_out(a, b, *, out):
     assert a.shape[1] == b.shape[0], "incompatible dimensions"
     M, K = a.shape
     _, N = b.shape
-    dot_out_dtype = tl.float32
-    grid = lambda META: _mm_grid(M, N, META)
-    with torch_device_fn.device(a.device), _blockified():
-        mm_kernel[grid](
+    _launch_mm_kernel(
+        (
             a,
             b,
             out,
@@ -1018,7 +1202,9 @@ def mm_out(a, b, *, out):
             b.stride(1),
             out.stride(0),
             out.stride(1),
-            dot_out_dtype=dot_out_dtype,
-            GROUP_M=8,
-        )
+        ),
+        _MM_OUT_KWARGS,
+        "mm_out",
+        lambda META: _mm_grid(M, N, META),
+    )
     return out

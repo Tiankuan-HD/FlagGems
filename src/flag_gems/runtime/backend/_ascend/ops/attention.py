@@ -1527,9 +1527,11 @@ def _attn_bwd_d256_materialize(
     sm_scale: tl.constexpr,
     head_id,
     BLOCK: tl.constexpr = 128,
+    TRANSPOSED_SCORES: tl.constexpr = False,
 ):
-    # Materialize only the lower triangle for one query head. Each row block
-    # owns its causal prefix; the gradient kernels never read the upper tiles.
+    # At 8K, key-major scores give dK/dV contiguous query spans. Shorter
+    # cached sequences retain query-major scores: transposing them regressed
+    # the measured 4K workload. Consumers skip the unwritten causal region.
     row = tl.program_id(0)
     head_id = head_id + tl.program_id(1)
     kv_head = (head_id // H) * KV_HEADS + (head_id % H) // (H // KV_HEADS)
@@ -1543,14 +1545,24 @@ def _attn_bwd_d256_materialize(
     delta = tl.load(Delta + head_id * S + m)
     for col in range(row + 1):
         n = col * BLOCK + tl.arange(0, BLOCK)
-        key = tl.load(K + kv_offset + n[None, :] * 256 + d[:, None])
-        scores = tl.dot(q, key) * sm_scale * 1.44269504
-        prob = tl.exp2(scores - lse[:, None])
-        prob = tl.where(m[:, None] >= n[None, :], prob, 0.0)
-        value = tl.load(V + kv_offset + n[None, :] * 256 + d[:, None])
-        dp = tl.dot(grad, value)
-        ds = prob * (dp - delta[:, None])
-        offsets = m[:, None] * S + n[None, :]
+        if TRANSPOSED_SCORES:
+            key = tl.load(K + kv_offset + n[:, None] * 256 + d[None, :])
+            scores = tl.dot(key, tl.trans(q)) * sm_scale * 1.44269504
+            prob = tl.exp2(scores - lse[None, :])
+            prob = tl.where(m[None, :] >= n[:, None], prob, 0.0)
+            value = tl.load(V + kv_offset + n[:, None] * 256 + d[None, :])
+            dp = tl.dot(value, tl.trans(grad))
+            ds = prob * (dp - delta[None, :])
+            offsets = n[:, None] * S + m[None, :]
+        else:
+            key = tl.load(K + kv_offset + n[None, :] * 256 + d[:, None])
+            scores = tl.dot(q, key) * sm_scale * 1.44269504
+            prob = tl.exp2(scores - lse[:, None])
+            prob = tl.where(m[:, None] >= n[None, :], prob, 0.0)
+            value = tl.load(V + kv_offset + n[None, :] * 256 + d[:, None])
+            dp = tl.dot(grad, value)
+            ds = prob * (dp - delta[:, None])
+            offsets = m[:, None] * S + n[None, :]
         # Match the existing dot-input casts; all score and dS math is FP32.
         tl.store(P + offsets, prob)
         tl.store(DS + offsets, ds)
@@ -1569,6 +1581,7 @@ def _attn_bwd_d256_cached_grad(
     COMPUTE_DQ: tl.constexpr,
     head_id,
     BLOCK: tl.constexpr = 128,
+    TRANSPOSED_SCORES: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     head_id = head_id + tl.program_id(1)
@@ -1585,7 +1598,8 @@ def _attn_bwd_d256_cached_grad(
     x_offset = x_head.to(tl.int64) * S * 256
     for start in range(begin, end, BLOCK):
         k = start + r
-        if COMPUTE_DQ:
+        # Stored-score transposition swaps the two gradient orientations.
+        if COMPUTE_DQ != TRANSPOSED_SCORES:
             a = tl.load(A + m[:, None] * S + k[None, :])
         else:
             a = tl.load(A + k[None, :] * S + m[:, None])
@@ -1593,6 +1607,269 @@ def _attn_bwd_d256_cached_grad(
         acc += tl.dot(a, x)
     out_offset = head_id.to(tl.int64) * S * 256
     tl.store(Y + out_offset + m[:, None] * 256 + d[None, :], acc * sm_scale)
+
+
+@libentry()
+@triton.jit
+def _attn_bwd_d256_stripe_materialize(
+    Q,
+    K,
+    V,
+    DO,
+    M,
+    Delta,
+    P,
+    DS,
+    H: tl.constexpr,
+    KH: tl.constexpr,
+    S: tl.constexpr,
+    sm_scale: tl.constexpr,
+    head_id,
+    q_start,
+    BLOCK: tl.constexpr = 128,
+    SEGMENTS: tl.constexpr = 1,
+):
+    row = tl.program_id(0)
+    segment = tl.program_id(1)
+    head_id = head_id + tl.program_id(2)
+    q_start = q_start + tl.program_id(2)
+    m = q_start + row * BLOCK + tl.arange(0, BLOCK)
+    d = tl.arange(0, 256)
+    kv_head = (head_id // H) * KH + (head_id % H) // (H // KH)
+    q_off = head_id.to(tl.int64) * S * 256
+    k_off = kv_head.to(tl.int64) * S * 256
+    # Reuse each row's Q/dO/LSE/Delta across its assigned key tiles. Segments
+    # own distinct column residues, so they never overlap in P or dS.
+    q = tl.load(Q + q_off + m[:, None] * 256 + d[None, :])
+    grad = tl.load(DO + q_off + m[:, None] * 256 + d[None, :])
+    lse = tl.load(M + head_id * S + m)
+    delta = tl.load(Delta + head_id * S + m)
+    for col in range(segment, q_start // BLOCK + row + 1, SEGMENTS):
+        n = col * BLOCK + tl.arange(0, BLOCK)
+        k = tl.load(K + k_off + n[None, :] * 256 + d[:, None])
+        scores = tl.dot(q, k) * sm_scale * 1.44269504
+        p = tl.exp2(scores - lse[:, None])
+        p = tl.where(m[:, None] >= n[None, :], p, 0.0)
+        v = tl.load(V + k_off + n[None, :] * 256 + d[:, None])
+        dp = tl.dot(grad, v)
+        ds = p * (dp - delta[:, None])
+        # Store each score tile contiguously: both gradient orientations
+        # consume it without the full-sequence stride between tile rows.
+        off = (
+            (row * (S // BLOCK) + col) * BLOCK * BLOCK
+            + tl.arange(0, BLOCK)[:, None] * BLOCK
+            + tl.arange(0, BLOCK)[None, :]
+        )
+        tl.store(P + off, p)
+        tl.store(DS + off, ds)
+
+
+@libentry()
+@triton.jit
+def _attn_bwd_d256_stripe_dq(
+    DS,
+    K,
+    DQ,
+    H: tl.constexpr,
+    KH: tl.constexpr,
+    S: tl.constexpr,
+    sm_scale: tl.constexpr,
+    head_id,
+    q_start,
+    BLOCK: tl.constexpr = 128,
+    FEATURE: tl.constexpr = 128,
+):
+    row = tl.program_id(0)
+    head_id = head_id + tl.program_id(2)
+    q_start = q_start + tl.program_id(2)
+    lm = row * BLOCK + tl.arange(0, BLOCK)
+    m = q_start + lm
+    d = tl.program_id(1) * FEATURE + tl.arange(0, FEATURE)
+    r = tl.arange(0, BLOCK)
+    kv_head = (head_id // H) * KH + (head_id % H) // (H // KH)
+    k_off = kv_head.to(tl.int64) * S * 256
+    acc = tl.zeros((BLOCK, FEATURE), tl.float32)
+    for start in range(0, q_start + (row + 1) * BLOCK, BLOCK):
+        n = start + r
+        tile = (row * (S // BLOCK) + start // BLOCK) * BLOCK * BLOCK
+        a = tl.load(DS + tile + r[:, None] * BLOCK + r[None, :])
+        k = tl.load(K + k_off + n[:, None] * 256 + d[None, :])
+        acc += tl.dot(a, k)
+    out_off = head_id.to(tl.int64) * S * 256
+    tl.store(DQ + out_off + m[:, None] * 256 + d[None, :], acc * sm_scale)
+
+
+@libentry()
+@triton.jit
+def _attn_bwd_d256_stripe_dkv(
+    A,
+    X,
+    Partial,
+    Out,
+    S: tl.constexpr,
+    sm_scale: tl.constexpr,
+    head_id,
+    q_start,
+    SPAN: tl.constexpr,
+    FINAL: tl.constexpr,
+    BLOCK: tl.constexpr = 128,
+    FEATURE: tl.constexpr = 128,
+):
+    row = tl.program_id(0)
+    head_id = head_id + tl.program_id(2)
+    q_start = q_start + tl.program_id(2)
+    n = row * BLOCK + tl.arange(0, BLOCK)
+    d = tl.program_id(1) * FEATURE + tl.arange(0, FEATURE)
+    r = tl.arange(0, BLOCK)
+    x_off = head_id.to(tl.int64) * S * 256
+    # A key tile is initialized by the first stripe intersecting its diagonal.
+    # Earlier stripes never wrote the future key tiles in Partial.
+    # Keep the dot accumulator in Cube storage throughout this stripe.
+    # Loading the previous stripe into it forces a GM/Vector update per dot.
+    # Combine FP32 stripe sums after the dot loop; cast only at final output.
+    # This groups FP32 additions by stripe instead of initializing each dot
+    # loop with the prior sum, so accuracy is checked against the fused path.
+    acc = tl.zeros((BLOCK, FEATURE), tl.float32)
+    begin = tl.maximum(q_start, row * BLOCK)
+    for start in range(begin, q_start + SPAN, BLOCK):
+        m = start + r
+        tile = (((start - q_start) // BLOCK) * (S // BLOCK) + row) * BLOCK * BLOCK
+        a = tl.load(A + tile + r[None, :] * BLOCK + r[:, None])
+        x = tl.load(X + x_off + m[:, None] * 256 + d[None, :])
+        acc += tl.dot(a, x)
+    prior = tl.load(
+        Partial + n[:, None] * 256 + d[None, :],
+        mask=row * BLOCK < q_start,
+        other=0.0,
+    )
+    acc += prior
+    if FINAL:
+        tl.store(Out + x_off + n[:, None] * 256 + d[None, :], acc * sm_scale)
+    else:
+        tl.store(Partial + n[:, None] * 256 + d[None, :], acc)
+
+
+def _aligned_d256_backward_striped(
+    do,
+    query,
+    key,
+    value,
+    o,
+    M,
+    *,
+    scale=None,
+    stripe_rows=3072,
+    feature_block=256,
+    materialize_segments=None,
+):
+    from .sum import sum_dim
+
+    b, h, s, d = query.shape
+    kh = key.shape[1]
+    assert d == 256 and s % 128 == 0
+    assert stripe_rows > 0 and stripe_rows % 128 == 0
+    assert feature_block in (64, 128, 256)
+    assert materialize_segments is None or (
+        isinstance(materialize_segments, int) and materialize_segments > 0
+    )
+    factor = 1.0 / 16 if scale is None else scale
+    stripe_rows = min(stripe_rows, s)
+    delta = torch.empty_like(M)
+    dq = torch.empty_like(query)
+    dk = torch.empty_like(query)
+    dv = torch.empty_like(query)
+    # At 32K, P/DS occupy 384 MiB and FP32 partials another 64 MiB.
+    # 3072 rows give 24 dQ tiles with all 256 features per Cube program.
+    # Keep the same tile storage when a final stripe is shorter.
+    probabilities = torch.empty(
+        (stripe_rows // 128, s // 128, 128, 128), device=query.device, dtype=query.dtype
+    )
+    ds = torch.empty_like(probabilities)
+    partial_k = torch.empty((s, 256), device=query.device, dtype=torch.float32)
+    partial_v = torch.empty_like(partial_k)
+    _attn_bwd_d256_preprocess[(s // 32, b * h)](
+        o,
+        do,
+        delta,
+        b,
+        h,
+        s,
+        BLOCK_M=32,
+        D_HEAD=256,
+        num_warps=4,
+        num_stages=1,
+    )
+    # All consumers run in the current stream before a stripe/head reuses P/DS.
+    # Gradient partials remain FP32 across stripes; there are no atomic updates.
+    for head_id in range(b * h):
+        for q_start in range(0, s, stripe_rows):
+            span = min(stripe_rows, s - q_start)
+            end = q_start + span
+            segments = (
+                max(1, triton.cdiv(32, span // 128))
+                if materialize_segments is None
+                else materialize_segments
+            )
+            _attn_bwd_d256_stripe_materialize[(span // 128, segments)](
+                query,
+                key,
+                value,
+                do,
+                M,
+                delta,
+                probabilities,
+                ds,
+                h,
+                kh,
+                s,
+                factor,
+                head_id,
+                q_start,
+                SEGMENTS=segments,
+                num_warps=4,
+                num_stages=2,
+                sync_solver=False,
+            )
+            _attn_bwd_d256_stripe_dq[(span // 128, 256 // feature_block)](
+                ds,
+                key,
+                dq,
+                h,
+                kh,
+                s,
+                factor,
+                head_id,
+                q_start,
+                FEATURE=feature_block,
+                num_warps=4,
+                num_stages=2,
+                sync_solver=False,
+            )
+            for a, x, partial, out, multiplier in (
+                (ds, query, partial_k, dk, factor),
+                (probabilities, do, partial_v, dv, 1.0),
+            ):
+                _attn_bwd_d256_stripe_dkv[(end // 128, 256 // feature_block)](
+                    a,
+                    x,
+                    partial,
+                    out,
+                    s,
+                    multiplier,
+                    head_id,
+                    q_start,
+                    span,
+                    end == s,
+                    FEATURE=feature_block,
+                    num_warps=4,
+                    num_stages=2,
+                    sync_solver=False,
+                )
+    if h != kh:
+        shape = (b, kh, h // kh, s, 256)
+        dk = sum_dim(dk.view(shape), [2])
+        dv = sum_dim(dv.view(shape), [2])
+    return dq, dk, dv
 
 
 def _aligned_d256_backward(
@@ -1635,6 +1912,10 @@ def _aligned_d256_backward(
     BATCH, Q_HEAD, Q_CTX = query.shape[:3]
     _, KV_HEAD, KV_CTX = key.shape[:3]
     group_head = Q_HEAD // KV_HEAD
+
+    # Keep the bounded-cache route limited to the measured 32K workload.
+    if Q_CTX == 32768:
+        return _aligned_d256_backward_striped(do, query, key, value, o, M, scale=scale)
 
     # Separate dK and dV so their FP32 accumulators are not simultaneously
     # live in L0C. The dK/dV query traversal is aligned down to M1; the causal
@@ -1705,6 +1986,7 @@ def _aligned_d256_backward(
                 Q_CTX,
                 sm_scale,
                 head_id,
+                TRANSPOSED_SCORES=Q_CTX == 8192,
                 num_warps=4,
                 num_stages=1,
                 sync_solver=False,
@@ -1724,6 +2006,7 @@ def _aligned_d256_backward(
                     factor,
                     compute_dq,
                     head_id,
+                    TRANSPOSED_SCORES=Q_CTX == 8192,
                     num_warps=4,
                     num_stages=2,
                     sync_solver=False,

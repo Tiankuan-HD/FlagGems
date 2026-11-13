@@ -27,6 +27,66 @@ class AttentionBenchmark(base.GenericBenchmark):
         return []
 
 
+class AscendD256AttentionBenchmark(base.GenericBenchmark):
+    DEFAULT_SHAPES = [(2, 4, 1, 32768, 256), (4, 6, 1, 8192, 256)]
+    DEFAULT_SHAPE_DESC = "batch, query_heads, kv_heads, seq_len, head_dim"
+
+    def set_shapes(self, shape_file_path=None):
+        # This regression benchmark targets the two training workloads;
+        # the generic Benchmark YAML entry uses incompatible tensor shapes.
+        self.shapes = list(self.DEFAULT_SHAPES)
+        self.shape_desc = self.DEFAULT_SHAPE_DESC
+
+
+@pytest.mark.scaled_dot_product_attention_backward
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend D256 benchmark")
+def test_scaled_dot_product_attention_ascend_d256_backward():
+    import torch_npu
+
+    def input_fn(shape, dtype, device):
+        batch, heads, kv_heads, seq_len, head_dim = shape
+        q, k, v = [
+            torch.randn(batch, h, seq_len, head_dim, device=device, dtype=dtype)
+            .mul_(0.5)
+            .requires_grad_()
+            for h in (heads, kv_heads, kv_heads)
+        ]
+        mask = torch.ones((2048, 2048), dtype=torch.bool).triu(1).to(device)
+        yield q, k, v, mask
+
+    def native(q, k, v, mask):
+        return torch_npu.npu_fusion_attention(
+            q,
+            k,
+            v,
+            q.shape[1],
+            "BNSD",
+            atten_mask=mask,
+            scale=q.shape[-1] ** -0.5,
+            keep_prob=1.0,
+            pre_tockens=2147483647,
+            next_tockens=0,
+            sparse_mode=2,
+        )[0]
+
+    def gems(q, k, v, mask):
+        return flag_gems.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=True
+        )
+
+    # Benchmark builds the forward graph once and times all three gradients,
+    # including preprocessing, bounded-cache launches and the GQA reduction.
+    bench = AscendD256AttentionBenchmark(
+        op_name="scaled_dot_product_attention_backward",
+        input_fn=input_fn,
+        torch_op=native,
+        gems_op=gems,
+        is_backward=True,
+        dtypes=[torch.bfloat16, torch.float16],
+    )
+    bench.run()
+
+
 def scaled_dot_product_flash_attention_input_fn(shape, dtype, device):
     query = torch.randn(shape, device=device, dtype=dtype)
     key = torch.randn(shape, device=device, dtype=dtype)

@@ -94,11 +94,6 @@ def linear_backward(
     # grad_bias = grad_output.sum(dim=0)
     # Shape: (batch, out_features) -> (out_features,)
     if output_mask[2]:
-        if weight.dtype == torch.float16:
-            grad_bias = sum_dim(grad_output_flat.to(torch.float32), dim=(0,)).to(
-                weight.dtype
-            )
-        else:
-            grad_bias = sum_dim(grad_output_flat, dim=(0,))
+        grad_bias = sum_dim(grad_output_flat, dim=(0,))
 
     return grad_input, grad_weight, grad_bias

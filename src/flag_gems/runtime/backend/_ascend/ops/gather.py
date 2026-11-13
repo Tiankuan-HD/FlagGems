@@ -40,7 +40,14 @@ def compute_base_offset(shape, strides, dim):
 
 
 @libentry()
-@triton.heuristics({"BLOCK_SIZE": lambda args: 1024})
+@triton.heuristics({
+    "BLOCK_SIZE": lambda args: max(
+        1024,
+        triton.next_power_of_2(
+            triton.cdiv(args["N"], 65535)
+        ),
+    )
+})
 @triton.jit
 def _gather_flat_kernel_fixed(
     inp,

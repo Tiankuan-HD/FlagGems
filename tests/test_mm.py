@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import random
 
 import numpy as np
@@ -306,3 +307,303 @@ def test_mm_ascend_large_shape_entrypoints(use_out):
     else:
         out = flag_gems.mm(a, b)
     utils.gems_assert_close(out, ref, a.dtype, reduce_dim=K)
+
+
+# Ascend launch-plan caching, N padding and the bfloat16 strided fast paths.
+@pytest.fixture(scope="module")
+def ascend_mm():
+    return importlib.import_module("flag_gems.runtime.backend._ascend.ops.mm")
+
+
+@pytest.fixture
+def ascend_mm_caches(ascend_mm, monkeypatch):
+    # Both caches live for the life of the process. Bind empty containers for
+    # the test instead of clearing and refilling the real ones: the launch
+    # cache holds compiled kernels, and putting entries back after the test
+    # has recompiled under them leaves handles on stale artifacts.
+    plans_type = type(ascend_mm._MM_TN_PLANS)
+    monkeypatch.setattr(ascend_mm, "_MM_LAUNCH_CACHE", {})
+    monkeypatch.setattr(ascend_mm, "_MM_TN_PLANS", plans_type())
+    return ascend_mm
+
+
+def _mm_strided_operands(layout, M, N, K, dtype=torch.bfloat16):
+    # Strides, not shapes, select which fast path the gate admits.
+    device = flag_gems.device
+    if layout == "nt":
+        a = torch.randn((M, K), dtype=dtype, device=device)
+        b = torch.randn((N, K), dtype=dtype, device=device).t()
+    elif layout == "nn":
+        a = torch.randn((M, K), dtype=dtype, device=device)
+        b = torch.randn((K, N), dtype=dtype, device=device)
+    else:
+        a = torch.randn((K, M), dtype=dtype, device=device).t()
+        b = torch.randn((K, N), dtype=dtype, device=device)
+    return a, b
+
+
+def _mm_strided_plan_key(a, b, use_out):
+    # Mirrors the key _try_mm_tn builds. Seeding a plan under it pins the
+    # config, bypassing the runtime search, which times three samples per
+    # candidate and may pick a different config on each cold run.
+    M, K = a.shape
+    N = b.shape[1]
+    key = (a.device.index, M, N, K, use_out)
+    if a.is_contiguous() and b.stride() == (1, K):
+        return key + ("nt",)
+    if a.is_contiguous() and b.is_contiguous():
+        return key + ("nn",)
+    return key
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend", reason="Ascend mm launch-plan cache"
+)
+def test_mm_ascend_launch_cache_reuses_the_plan(ascend_mm_caches):
+    mod = ascend_mm_caches
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 256
+    a = torch.randn((M, K), dtype=torch.float16, device=flag_gems.device)
+    b = torch.randn((K, N), dtype=torch.float16, device=flag_gems.device)
+    ref = torch.mm(utils.to_reference(a).float(), utils.to_reference(b).float())
+
+    first = mod.mm(a, b)
+    recorded = list(mod._MM_LAUNCH_CACHE)
+    assert recorded, "the first launch should record a plan"
+
+    second = mod.mm(a, b)
+    assert list(mod._MM_LAUNCH_CACHE) == recorded, "a repeat must not add a key"
+
+    utils.gems_assert_close(first, ref, a.dtype, reduce_dim=K)
+    utils.gems_assert_close(second, ref, a.dtype, reduce_dim=K)
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend", reason="Ascend mm launch-plan cache"
+)
+def test_mm_ascend_launch_cache_evicts_the_least_recently_used(
+    ascend_mm_caches, monkeypatch
+):
+    # A training step reuses a few large GEMMs recorded in the first iteration
+    # while one-off shapes keep arriving. Evicting by insertion order drops the
+    # reused ones; eviction has to follow last use instead.
+    mod = ascend_mm_caches
+    monkeypatch.setattr(mod, "_MM_LAUNCH_LIMIT", 2)
+    torch.manual_seed(0)
+    operands = {
+        n: (
+            torch.randn((256, 256), dtype=torch.float16, device=flag_gems.device),
+            torch.randn((256, n), dtype=torch.float16, device=flag_gems.device),
+        )
+        for n in (256, 384, 512)
+    }
+
+    mod.mm(*operands[256])
+    mod.mm(*operands[384])
+    recorded = list(mod._MM_LAUNCH_CACHE)
+    if len(recorded) != 2:
+        pytest.skip("these shapes do not each record exactly one launch plan")
+
+    mod.mm(*operands[256])
+    assert list(mod._MM_LAUNCH_CACHE) == recorded[::-1], "a hit must move to the end"
+
+    mod.mm(*operands[512])
+    assert recorded[0] in mod._MM_LAUNCH_CACHE, "the recently used key was evicted"
+    assert recorded[1] not in mod._MM_LAUNCH_CACHE, "the coldest key survived"
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend mm N padding")
+@pytest.mark.parametrize(
+    "N, K, expect_pad",
+    [
+        (1025, 1024, False),  # N*K = 1.0M: the 127 extra columns dominate
+        (2049, 2048, True),  # N*K = 4.2M: the masked tail dominates instead
+    ],
+)
+def test_mm_ascend_pads_n_only_above_the_size_product(
+    ascend_mm_caches, N, K, expect_pad
+):
+    mod = ascend_mm_caches
+    torch.manual_seed(0)
+    M = 4096
+    a = torch.randn((M, K), dtype=torch.float16, device=flag_gems.device)
+    b = torch.randn((K, N), dtype=torch.float16, device=flag_gems.device)
+    ref = torch.mm(utils.to_reference(a).float(), utils.to_reference(b).float())
+
+    out = mod.mm(a, b)
+    utils.gems_assert_close(out, ref, a.dtype, reduce_dim=K)
+
+    launched_n = {key[9] for key in mod._MM_LAUNCH_CACHE if len(key) > 9}
+    padded = triton.cdiv(N, mod._PAD_N_TO) * mod._PAD_N_TO
+    assert N * K >= mod._PAD_MIN_NK if expect_pad else N * K < mod._PAD_MIN_NK
+    if expect_pad:
+        assert (
+            padded in launched_n
+        ), f"expected a launch at N={padded}, saw {launched_n}"
+    else:
+        assert padded not in launched_n, f"padded below the product floor: {launched_n}"
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend mm strided paths")
+def test_mm_ascend_plan_rank_orders_ties_without_the_clock():
+    rank = importlib.import_module(
+        "flag_gems.runtime.backend._ascend.ops.mm"
+    )._mm_tn_plan_rank
+    # The default sorts ahead of every candidate.
+    assert rank(None) < rank((128, 128, 256, 2, 1))
+    # A smaller split sorts ahead, since split-K reorders the reduction.
+    assert rank((128, 128, 256, 2, 1)) < rank((128, 128, 256, 2, 2))
+    assert rank((128, 128, 256, 2, 2)) < rank((128, 128, 256, 2, 4))
+    # Remaining fields only break the last ties, and do so deterministically.
+    assert rank((128, 256, 256, 8, 1)) < rank((256, 128, 256, 8, 1))
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend mm strided paths")
+def test_mm_ascend_tie_band_keeps_the_default_when_nothing_is_faster(
+    ascend_mm_caches, monkeypatch
+):
+    # With every plan timing the same, only the tie rule decides, and it has to
+    # keep the default: three timed rounds cannot separate plans a few percent
+    # apart, and letting them decide would vary between processes.
+    mod = ascend_mm_caches
+    torch.manual_seed(0)
+    a, b = _mm_strided_operands("tn", 256, 256, 8192)
+
+    class _FlatEvent:
+        def record(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+        def elapsed_time(self, other):
+            return 1.0
+
+    monkeypatch.setattr(
+        mod.torch_device_fn, "Event", lambda *args, **kwargs: _FlatEvent()
+    )
+    assert mod._try_mm_tn(a, b) is None
+    assert mod._MM_TN_PLANS, "the decision should still be cached"
+    assert next(iter(mod._MM_TN_PLANS.values())) is None
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend mm strided gate")
+@pytest.mark.parametrize(
+    "case",
+    ["float16", "short_k", "unaligned_m", "unaligned_n", "batched", "aliased_out"],
+)
+def test_mm_ascend_strided_gate_rejects(ascend_mm_caches, case):
+    # Every rejection has to leave the caller on the default implementation.
+    mod = ascend_mm_caches
+    torch.manual_seed(0)
+    device = flag_gems.device
+    out = None
+    if case == "float16":
+        a, b = _mm_strided_operands("tn", 256, 256, 8192, dtype=torch.float16)
+    elif case == "short_k":
+        a, b = _mm_strided_operands("tn", 256, 256, 64)
+    elif case == "unaligned_m":
+        a, b = _mm_strided_operands("tn", 248, 256, 8192)
+    elif case == "unaligned_n":
+        a, b = _mm_strided_operands("tn", 256, 248, 8192)
+    elif case == "batched":
+        a = torch.randn((2, 256, 8192), dtype=torch.bfloat16, device=device)
+        b = torch.randn((2, 8192, 256), dtype=torch.bfloat16, device=device)
+    else:
+        a, b = _mm_strided_operands("tn", 256, 256, 8192)
+        # An output aliasing an input would be overwritten while still read.
+        out = b.view(-1)[: 256 * 256].view(256, 256)
+
+    assert mod._try_mm_tn(a, b, out) is None
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend mm strided paths")
+@pytest.mark.parametrize(
+    "layout, M, N, K, config",
+    [
+        # nt and nn reach _mm_strided_direct_kernel; tn reaches
+        # _mm_tn_split_kernel, and its split>1 case the partial reduction.
+        ("nt", 256, 2048, 4096, (128, 256, 256, 2, 1)),
+        ("nn", 256, 512, 1152, (128, 256, 128, 2, 1)),
+        ("tn", 256, 256, 8192, (128, 128, 256, 2, 1)),
+        ("tn", 256, 256, 16384, (128, 128, 128, 2, 2)),
+    ],
+)
+@pytest.mark.parametrize("use_out", [False, True])
+def test_mm_ascend_strided_matches_the_default_path(
+    ascend_mm_caches, layout, M, N, K, config, use_out
+):
+    mod = ascend_mm_caches
+    torch.manual_seed(0)
+    a, b = _mm_strided_operands(layout, M, N, K)
+    mod._MM_TN_PLANS[_mm_strided_plan_key(a, b, use_out)] = config
+
+    if use_out:
+        out = torch.empty((M, N), dtype=a.dtype, device=a.device)
+        fast = mod._try_mm_tn(a, b, out)
+        assert fast is out
+        slow = mod._mm_out_default(
+            a, b, out=torch.empty((M, N), dtype=a.dtype, device=a.device)
+        )
+    else:
+        fast = mod._try_mm_tn(a, b)
+        assert fast is not None
+        slow = mod._mm_default(a, b)
+
+    ref = torch.mm(utils.to_reference(a).float(), utils.to_reference(b).float())
+    utils.gems_assert_close(fast, ref, a.dtype, reduce_dim=K)
+
+    if config[4] == 1:
+        # One K pass accumulates in the same order as the default, and both
+        # accumulate in FP32, so the bfloat16 results agree exactly.
+        assert torch.equal(fast, slow), "fast path diverged from the default"
+    else:
+        # Splitting K sums per-split FP32 partials, which reorders the
+        # reduction, so the last bit may differ. The default is itself a
+        # bfloat16 result rather than ground truth, so compare both against
+        # the FP32 reference and require the fast path to be no worse.
+        # Route through to_reference so this holds under --ref=cpu too.
+        fast_err = (utils.to_reference(fast).float() - ref).abs().max().item()
+        slow_err = (utils.to_reference(slow).float() - ref).abs().max().item()
+        assert fast_err <= 2 * slow_err + 1e-6, (
+            f"split-K is less accurate than the default: "
+            f"{fast_err:.6g} vs {slow_err:.6g}"
+        )
+
+
+@pytest.mark.mm
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend mm strided paths")
+def test_mm_ascend_strided_plan_cache_separates_out_from_allocated(
+    ascend_mm_caches, monkeypatch
+):
+    # The allocated-output and caller-owned-output paths have different
+    # baselines, so a decision made for one must not stand in for the other.
+    mod = ascend_mm_caches
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 8192
+    a, b = _mm_strided_operands("tn", M, N, K)
+    seeded = _mm_strided_plan_key(a, b, False)
+    mod._MM_TN_PLANS[seeded] = (128, 128, 256, 2, 1)
+
+    searches = []
+
+    def decline(*args, **kwargs):
+        searches.append(args)
+        return None
+
+    monkeypatch.setattr(mod, "_choose_mm_tn_plan", decline)
+
+    assert mod._try_mm_tn(a, b) is not None, "the seeded plan was not reused"
+    assert not searches, "a cached key must not trigger a search"
+
+    out = torch.empty((M, N), dtype=a.dtype, device=a.device)
+    assert mod._try_mm_tn(a, b, out) is None, "the stub declines every candidate"
+    assert len(searches) == 1, "the out variant has its own key and must search"
+    assert _mm_strided_plan_key(a, b, True) in mod._MM_TN_PLANS

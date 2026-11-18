@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
+from triton.runtime import driver
 
 from flag_gems.config import use_c_extension
 from flag_gems.runtime import torch_device_fn
@@ -1398,6 +1400,197 @@ def _attn_bwd_d256(
             tl.store(DV + kv_ptrs, dv, mask=mask_n[:, None])
 
 
+@triton.jit
+def _query_tile(worker, step, Q_TILES: tl.constexpr, WORKERS: tl.constexpr):
+    pair = worker + (step // 2) * WORKERS
+    head = pair // (Q_TILES // 2)
+    short = pair % (Q_TILES // 2)
+    row = tl.where(step % 2 == 0, Q_TILES - 1 - short, short)
+    return head, row
+
+
+@triton.jit
+def _publish_qk(q, key_ptr, qk_workspace, tile, width: tl.constexpr):
+    rc = tl.arange(0, width)
+    rm = tl.arange(0, 64)
+    key = tl.load(key_ptr + (tile * width + rc[:, None]) * 256 + tl.arange(0, 256)[None, :])
+    qk = tl.dot(q, tl.trans(key), allow_tf32=False)
+    slot = tile % 2
+    tl.store(qk_workspace + slot * 64 * width + rm[:, None] * width + rc[None, :], qk)
+    if slot == 0:
+        al.sync_block_set("cube", "vector", 0)
+    else:
+        al.sync_block_set("cube", "vector", 1)
+
+
+@triton.jit
+def _publish_pv(value_ptr, p_workspace, pv_workspace, tile, width: tl.constexpr):
+    rc = tl.arange(0, width)
+    rd = tl.arange(0, 256)
+    rm = tl.arange(0, 64)
+    value = tl.load(value_ptr + (tile * width + rc[:, None]) * 256 + rd[None, :])
+    slot = tile % 2
+    # Mode 2 credits the Cube after both Vector shards publish this P slot.
+    if slot == 0:
+        al.sync_block_wait("vector", "cube", 3)
+    else:
+        al.sync_block_wait("vector", "cube", 4)
+    p = tl.load(p_workspace + (slot * 64 + rm[:, None]) * width + rc[None, :])
+    pv = tl.dot(p, value, allow_tf32=False)
+    tl.store(pv_workspace + (slot * 64 + rm[:, None]) * 256 + rd[None, :], pv)
+    if slot == 0:
+        al.sync_block_set("cube", "vector", 2)
+    else:
+        al.sync_block_set("cube", "vector", 5)
+
+
+@triton.jit
+def _publish_probability(
+    qk_workspace, p_workspace, tile, row, lane, maximum, total, last,
+    scale, width: tl.constexpr,
+):
+    rc = tl.arange(0, width)
+    rm = lane * 32 + tl.arange(0, 32)
+    slot = tile % 2
+    if slot == 0:
+        al.sync_block_wait("cube", "vector", 0)
+    else:
+        al.sync_block_wait("cube", "vector", 1)
+    qk = tl.load(qk_workspace + slot * 64 * width + rm[:, None] * width + rc[None, :])
+    scores = qk * scale
+    if tile == last:
+        q_pos = row * 64 + rm
+        k_pos = tile * width + rc
+        scores = tl.where(q_pos[:, None] >= k_pos[None, :], scores, -float("inf"))
+    max_new = tl.maximum(maximum, tl.max(scores, 1))
+    probability = tl.exp2(scores - max_new[:, None])
+    alpha = tl.exp2(maximum - max_new)
+    tl.store(
+        p_workspace + (slot * 64 + rm[:, None]) * width + rc[None, :],
+        probability.to(p_workspace.dtype.element_ty),
+    )
+    if slot == 0:
+        al.sync_block_set("vector", "cube", 3)
+    else:
+        al.sync_block_set("vector", "cube", 4)
+    total = total * alpha + tl.sum(probability, 1)
+    return max_new, total, alpha
+
+
+@triton.jit
+def _accumulate_pv(pv_workspace, tile, lane, acc, alpha):
+    rm = lane * 32 + tl.arange(0, 32)
+    rd = tl.arange(0, 256)
+    slot = tile % 2
+    scaled_acc = acc * alpha[:, None]
+    if slot == 0:
+        al.sync_block_wait("cube", "vector", 2)
+    else:
+        al.sync_block_wait("cube", "vector", 5)
+    pv = tl.load(pv_workspace + (slot * 64 + rm[:, None]) * 256 + rd[None, :])
+    return scaled_acc + pv
+
+
+@libentry()
+@triton.jit
+def _attn_fwd_d256_cv(
+    Q, K, V, Out, Lse, QKTemp, PTemp, PVTemp, scale,
+    S: tl.constexpr, HEADS: tl.constexpr, KV_HEADS: tl.constexpr, BATCH: tl.constexpr,
+    WORKERS: tl.constexpr, KV_WIDTH: tl.constexpr,
+):
+    Q_TILES: tl.constexpr = S // 64
+    PAIRS: tl.constexpr = BATCH * HEADS * (Q_TILES // 2)
+    worker = tl.program_id(0)
+    task_count = 2 * ((PAIRS + WORKERS - 1 - worker) // WORKERS)
+    qk_workspace = QKTemp + worker * (2 * 64 * KV_WIDTH)
+    p_workspace = PTemp + worker * (2 * 64 * KV_WIDTH)
+    pv_workspace = PVTemp + worker * (2 * 64 * 256)
+    dim = tl.arange(0, 256)
+
+    with al.scope(core_mode="cube"):
+        for step in range(task_count):
+            head, row = _query_tile(worker, step, Q_TILES, WORKERS)
+            kv_head = head // HEADS * KV_HEADS + head % HEADS // (HEADS // KV_HEADS)
+            q_rows = row * 64 + tl.arange(0, 64)
+            q = tl.load(Q + (head.to(tl.int64) * S + q_rows[:, None]) * 256 + dim[None, :])
+            key_ptr = K + kv_head.to(tl.int64) * S * 256
+            value_ptr = V + kv_head.to(tl.int64) * S * 256
+            last = row * 64 // KV_WIDTH
+
+            _publish_qk(q, key_ptr, qk_workspace, 0, KV_WIDTH)
+            for tile in range(last):
+                # Dispatch QK(t+1) before waiting for either half of P(t).
+                # P(t-1) was already consumed, so the old QK slot is free.
+                _publish_qk(q, key_ptr, qk_workspace, tile + 1, KV_WIDTH)
+                _publish_pv(value_ptr, p_workspace, pv_workspace, tile, KV_WIDTH)
+            _publish_pv(value_ptr, p_workspace, pv_workspace, last, KV_WIDTH)
+
+    with al.scope(core_mode="vector"):
+        tl.static_assert(al.sub_vec_num() == 2)
+        lane = al.sub_vec_id().to(tl.int32)
+        for step in range(task_count):
+            head, row = _query_tile(worker, step, Q_TILES, WORKERS)
+            last = row * 64 // KV_WIDTH
+            max_score = tl.full((32,), -float("inf"), tl.float32)
+            total = tl.full((32,), 1.0, tl.float32)
+            acc = tl.full((32, 256), 0.0, tl.float32)
+            alpha = tl.full((32,), 0.0, tl.float32)
+            # Start by publishing P(0); finish by draining PV(last).
+            # Both Vector shards read PV(t-1) before publishing P(t+1).
+            for tile in range(last + 2):
+                alpha_next = alpha
+                if tile <= last:
+                    max_score, total, alpha_next = _publish_probability(
+                        qk_workspace, p_workspace, tile, row, lane,
+                        max_score, total, last, scale, KV_WIDTH,
+                    )
+                if tile > 0:
+                    acc = _accumulate_pv(pv_workspace, tile - 1, lane, acc, alpha)
+                alpha = alpha_next
+            rows = head.to(tl.int64) * S + row * 64 + lane * 32 + tl.arange(0, 32)
+            tl.store(Out + rows[:, None] * 256 + dim[None, :], acc / total[:, None])
+            tl.store(Lse + rows, max_score + tl.log2(total))
+
+
+def _d256_causal_forward_cv(query, key, value, scale=None):
+    """Requires aligned contiguous FP16/BF16 BNSD and two Vector subcores."""
+    batch, heads, seq, dim = query.shape
+    kv_heads = key.shape[1]
+    if (
+        batch <= 0 or dim != 256 or seq < 128 or seq % 128 or seq > 2**24
+        or heads <= 0 or kv_heads <= 0 or heads % kv_heads
+        or key.shape != (batch, kv_heads, seq, dim) or value.shape != key.shape
+        or any(
+            x.dtype not in (torch.bfloat16, torch.float16)
+            or x.dtype != query.dtype or not x.is_contiguous() or x.device != query.device
+            for x in (query, key, value)
+        )
+    ):
+        raise ValueError("The explicit D256 forward requires aligned FP16/BF16 BNSD Q/K/V")
+    width = 256 if seq % 256 == 0 else 128
+    with torch_device_fn.device(query.device):
+        properties = driver.active.utils.get_device_properties(query.device.index)
+    workers = min(properties["num_aicore"], batch * heads * (seq // 128))
+    score_scale = (1.0 / 16 if scale is None else scale) * 1.44269504
+    output = torch.empty_like(query)
+    lse = torch.empty((batch, heads, seq), device=query.device, dtype=torch.float32)
+    qk = torch.empty((workers, 2, 64, width), device=query.device, dtype=torch.float32)
+    p = torch.empty((workers, 2, 64, width), device=query.device, dtype=query.dtype)
+    pv = torch.empty((workers, 2, 64, dim), device=query.device, dtype=torch.float32)
+    with torch_device_fn.device(query.device):
+        _attn_fwd_d256_cv[(workers,)](
+            query, key, value, output, lse, qk, p, pv, score_scale,
+            seq, heads, kv_heads, batch, workers, width,
+            num_warps=4,
+            num_stages=1,
+            enable_auto_bind_sub_block=False,
+            disable_auto_inject_block_sync=True,
+            sync_solver=False,
+            enable_ubuf_saving=True,
+        )
+    return output, lse
+
+
 def _aligned_d256_forward(
     query,
     key,
@@ -1409,6 +1602,13 @@ def _aligned_d256_forward(
     enable_gqa=False,
 ):
     logger.debug("GEMS_ASCEND ALIGNED_D256_ATTENTION_FORWARD")
+    if (
+        _use_aligned_d256(
+            query, key, value, attn_mask, dropout_p, is_causal, enable_gqa
+        )
+        and (scale is None or isinstance(scale, (int, float)) and math.isfinite(scale))
+    ):
+        return _d256_causal_forward_cv(query, key, value, scale=scale)
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K = query.shape[-1], key.shape[-1]
     # when v is in float8_e5m2 it is transposed.

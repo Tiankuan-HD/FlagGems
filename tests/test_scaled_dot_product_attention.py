@@ -754,3 +754,53 @@ def test_scaled_dot_product_attention_ascend_d256_training_autograd(
             atol=tolerance,
             rtol=tolerance,
         )
+
+
+@pytest.mark.scaled_dot_product_attention_forward
+@pytest.mark.skipif(flag_gems.vendor_name != "ascend", reason="Ascend D256 CV regression")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "batch,heads,kv_heads,seq_len,scale",
+    [(1, 1, 1, 128, None), (3, 6, 2, 384, 0.0), (1, 3, 1, 768, -0.125)],
+)
+def test_scaled_dot_product_attention_ascend_d256_cv_shapes(
+    dtype, batch, heads, kv_heads, seq_len, scale, monkeypatch
+):
+    from flag_gems.runtime.backend._ascend.ops import attention
+
+    original = attention._d256_causal_forward_cv
+    calls = []
+
+    def record_dispatch(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(attention, "_d256_causal_forward_cv", record_dispatch)
+    generator = torch.Generator().manual_seed(20261118)
+    inputs = [
+        (torch.randn(batch, h, seq_len, 256, generator=generator) * 0.5).to(dtype)
+        for h in (heads, kv_heads, kv_heads)
+    ]
+    q, k, v = [x.double() for x in inputs]
+    factor = 1 / 16 if scale is None else scale
+    k = k.repeat_interleave(heads // kv_heads, dim=1)
+    v = v.repeat_interleave(heads // kv_heads, dim=1)
+    scores = (q @ k.transpose(-1, -2)) * factor
+    mask = torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1)
+    scores = scores.masked_fill(mask, -float("inf"))
+    expected = scores.softmax(-1) @ v
+    expected_lse = scores.logsumexp(-1) / np.log(2.0)
+    actual, lse = attention.scaled_dot_product_attention_forward(
+        *[x.to(device) for x in inputs],
+        is_causal=True,
+        enable_gqa=heads != kv_heads,
+        scale=scale,
+    )
+    assert calls == [True]
+    tolerance = 0.004 if dtype == torch.bfloat16 else 0.001
+    torch.testing.assert_close(
+        actual.cpu().float(), expected.float(), atol=tolerance, rtol=0.02,
+    )
+    torch.testing.assert_close(
+        lse.cpu().float(), expected_lse.float(), atol=1e-4, rtol=1e-5,
+    )

@@ -295,6 +295,13 @@ _HUGE_K = 8192
 # which padding B and copying the result back are 109 us, so 528 us net. 128 is
 # the smallest BLOCK_N any candidate uses, so aligning to it satisfies them all.
 _PAD_N_TO = 128
+# Padding widens N to the next multiple of _PAD_N_TO, so it adds at most 127
+# columns -- a share of the work set by N, while K sets what the masked tail
+# costs. The two trade off, so neither bound alone separates the cases: at
+# K=2048 padding loses 8.8% for N=1025 but wins 8.4% for N=2049, and at
+# N=1025 it loses 35% for K=1024 yet wins 5.1% for K=4096. Their product
+# splits the measured grid cleanly.
+_PAD_MIN_NK = 4 * 1024 * 1024
 
 _GROUP_M_CANDIDATES = (1, 2, 8, 16)
 _GROUP_M_DEFAULTS = (1,)
@@ -928,6 +935,10 @@ def _mm_strided_direct_kernel(
 
 # Tune supported dense BF16 layouts against the existing mm path.
 # The existing implementation remains a candidate for every eligible input.
+# Plans whose medians land within this factor of the best are treated as tied
+# and ordered by _mm_tn_plan_rank. Measured spread between repeated searches on
+# one shape is a few percent, so a narrower band would still let noise decide.
+_MM_TN_TIE_BAND = 1.05
 _MM_TN_TILES = ((128, 128), (128, 256), (256, 128))
 _MM_TN_MAX_WORKSPACE = 16 * 1024 * 1024
 _MM_TN_PLANS = OrderedDict()
@@ -1042,6 +1053,19 @@ def _launch_mm_tn(a, b, out, config):
     return out
 
 
+def _mm_tn_plan_rank(config):
+    """Order plans that time the same, so the winner does not depend on noise.
+
+    `None` is the existing implementation: preferring it when nothing measures
+    faster keeps the result bit-identical to an unaccelerated run. Among the
+    rest a smaller split wins, because split-K sums per-split partials and so
+    reorders the reduction; the remaining fields only break the last ties.
+    """
+    if config is None:
+        return (0, 0, ())
+    return (1, config[4], config[:4])
+
+
 def _run_mm_tn_plan(a, b, out, config):
     if config is not None:
         return _launch_mm_tn(a, b, out, config)
@@ -1078,7 +1102,17 @@ def _choose_mm_tn_plan(a, b, out, candidates):
     medians = {
         config: statistics.median(samples) for config, samples in timings.items()
     }
-    fastest = min(plans, key=medians.__getitem__)
+    # Three samples cannot separate plans that are a few percent apart, so
+    # letting the measurement break such a tie makes the choice vary between
+    # processes: two ranks running the same shape would take different
+    # kernels, and split-K reorders the reduction, so their results then
+    # differ in the last bit. Decide ties by a fixed rule instead. A plan that
+    # is genuinely faster stays outside the band and still wins.
+    cutoff = min(medians.values()) * _MM_TN_TIE_BAND
+    fastest = min(
+        (config for config in plans if medians[config] <= cutoff),
+        key=_mm_tn_plan_rank,
+    )
     # Keep the existing path when the gain is within measurement noise.
     return fastest if medians[fastest] < 0.95 * medians[None] else None
 
@@ -1523,7 +1557,13 @@ def _mm_default(a, b):
     # reduction has to be long enough for the K loop's masking to dominate, and
     # the output wide enough that one extra row of tiles is a small share.
     pad_n = 0
-    if N % _PAD_N_TO != 0 and M >= 4096 and N >= 1024 and K >= 1024:
+    if (
+        N % _PAD_N_TO != 0
+        and M >= 4096
+        and N >= 1024
+        and K >= 1024
+        and N * K >= _PAD_MIN_NK
+    ):
         pad_n = triton.cdiv(N, _PAD_N_TO) * _PAD_N_TO
     if pad_n:
         b_work = torch.empty((K, pad_n), device=device, dtype=b.dtype)

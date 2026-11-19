@@ -26,13 +26,6 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-def prune_mean_configs(configs, named_args, **kwargs):
-    M = named_args["M"]
-    return [
-        cfg for cfg in configs
-        if triton.cdiv(M, cfg.kwargs["BLOCK_M"]) <= 65535
-    ]
-
 @libentry()
 @triton.jit
 def mean_kernel_1(
@@ -65,35 +58,76 @@ def mean(inp, *, dtype=None):
         out = mid.sum() / M
     return out.to(dtype)
 
+def choose_mean_dim_tiling(M, N):
+    MAX_COREDIM = 65535
+    TARGET_PROGRAMS = 8192
+    MAX_BLOCK_N = 256
+    MAX_SUB = 256
+    ACC_BUDGET_BYTES = 64 * 1024
+
+    block_n = min(triton.next_power_of_2(N), MAX_BLOCK_N)
+
+    max_sub_by_budget = ACC_BUDGET_BYTES // (block_n * 4)
+    block_m_sub = min(
+        MAX_SUB,
+        1 << (max_sub_by_budget.bit_length() - 1),
+    )
+
+    block_m_main = triton.next_power_of_2(
+        max(
+            block_m_sub,
+            triton.cdiv(M, TARGET_PROGRAMS),
+            triton.cdiv(M, MAX_COREDIM),
+        )
+    )
+
+    if block_m_main > block_m_sub:
+        block_m_sub = min(block_m_sub, 128)
+
+    return block_m_main, block_m_sub, block_n
 
 @libentry()
-@triton.autotune(
-    configs=runtime.get_tuned_config("mean"),
-    key=["M", "N"],
-    prune_configs_by={
-        "early_config_prune": prune_mean_configs,
-    },
-)
 @triton.jit
-def mean_dim_kernel(X, Mean, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-    # Map the program id to the row of X it should compute.
-    pid = ext.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    X = X + pid * N
-    Mean = Mean + pid
-    row_mask = pid < M
+def mean_dim_kernel(
+    X,
+    Mean,
+    M,
+    N,
+    BLOCK_M_MAIN: tl.constexpr,
+    BLOCK_M_SUB: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    base_row = ext.program_id(0) * BLOCK_M_MAIN
 
-    # Compute mean
-    _mean = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    for off in range(0, N, BLOCK_N):
-        cols = off + tl.arange(0, BLOCK_N)[None, :]
-        col_mask = cols < N
-        mask = row_mask and col_mask
+    for row_off in range(0, BLOCK_M_MAIN, BLOCK_M_SUB):
+        rows = base_row + row_off + tl.arange(0, BLOCK_M_SUB)[:, None]
+        row_mask = rows < M
 
-        a = tl.load(X + cols, mask, other=0.0).to(tl.float32)
-        _mean += a
-    mean = tl.sum(_mean, axis=1) / N
-    mean = mean[:, None]
-    tl.store(Mean, mean, row_mask)
+        row_x = X + rows * N
+        acc = tl.zeros(
+            [BLOCK_M_SUB, BLOCK_N],
+            dtype=tl.float32,
+        )
+
+        for off in range(0, N, BLOCK_N):
+            cols = off + tl.arange(0, BLOCK_N)[None, :]
+            mask = row_mask & (cols < N)
+
+            vals = tl.load(
+                row_x + cols,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+
+            acc += vals
+
+        means = tl.sum(acc, axis=1) / N
+
+        tl.store(
+            Mean + rows,
+            means[:, None],
+            mask=row_mask,
+        )
 
 
 def mean_dim(x, dim, keepdim=False, *, dtype=None):
@@ -116,10 +150,22 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
         shape[i] = 1
     M = x.numel() // N
     out = torch.empty(shape, dtype=dtype, device=x.device)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),)
+    block_m_main, block_m_sub, block_n = choose_mean_dim_tiling(M, N)
 
+    grid = (triton.cdiv(M, block_m_main),)
+    
     with torch_device_fn.device(x.device):
-        mean_dim_kernel[grid](x, out, M, N)
+        mean_dim_kernel[grid](
+            x,
+            out,
+            M,
+            N,
+            BLOCK_M_MAIN=block_m_main,
+            BLOCK_M_SUB=block_m_sub,
+            BLOCK_N=block_n,
+            num_warps=4,
+            num_stages=2,
+        ) 
     if not keepdim:
         out = out.squeeze(dim)
     return out

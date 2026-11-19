@@ -26,6 +26,12 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
+def prune_mean_configs(configs, named_args, **kwargs):
+    M = named_args["M"]
+    return [
+        cfg for cfg in configs
+        if triton.cdiv(M, cfg.kwargs["BLOCK_M"]) <= 65535
+    ]
 
 @libentry()
 @triton.jit
@@ -64,6 +70,9 @@ def mean(inp, *, dtype=None):
 @triton.autotune(
     configs=runtime.get_tuned_config("mean"),
     key=["M", "N"],
+    prune_configs_by={
+        "early_config_prune": prune_mean_configs,
+    },
 )
 @triton.jit
 def mean_dim_kernel(X, Mean, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
